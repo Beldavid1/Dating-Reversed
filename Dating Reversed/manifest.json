@@ -1,0 +1,16 @@
+{
+  "Name": "Dating Reversed",
+  "Author": "Beldavid",
+  "Version": "4.0.0",
+  "Description": "Sets an NPC's relationship to Dating after your custom bouquet event.",
+  "UniqueID": "DatingReversed",
+  "EntryDll": "DatingReversed.dll",
+  "MinimumApiVersion": "4.0.0",
+  "UpdateKeys": [ "Nexus:36672" ],
+  "Dependencies": [
+    {
+      "UniqueID": "spacechase0.GenericModConfigMenu",
+      "IsRequired": true
+    }
+  ]
+}

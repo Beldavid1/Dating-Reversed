@@ -1,0 +1,35 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+	<PropertyGroup>
+		<!-- Must target net6.0 so you get SMAPI 4.x APIs -->
+		<TargetFramework>net6.0</TargetFramework>
+		<LangVersion>latest</LangVersion>
+		<Nullable>enable</Nullable>
+		<AssemblyName>DatingReversed</AssemblyName>
+
+		<!-- Point this at YOUR game folder (where SMAPI installed) -->
+		<GamePath>F:\SteamLibrary\steamapps\common\Stardew Valley</GamePath>
+
+		<!-- Tell ModBuildConfig which SMAPI version to pull in -->
+		<SMAPIVersion>4.3.2</SMAPIVersion>
+	</PropertyGroup>
+	<ItemGroup>
+		<PackageReference Include="Pathoschild.Stardew.ModBuildConfig" Version="4.4.0" PrivateAssets="all" />	</ItemGroup>
+	<ItemGroup>
+		<!-- Other mod dependencies (e.g. config menu) -->
+		<Reference Include="GenericModConfigMenu">
+			<HintPath>F:\SteamLibrary\steamapps\common\Stardew Valley\Mods\GenericModConfigMenu\GenericModConfigMenu.dll</HintPath>
+			<Private>False</Private>
+		</Reference>
+	</ItemGroup>
+
+	<ItemGroup>
+		<None Update="manifest.json">
+			<CopyToOutputDirectory>Always</CopyToOutputDirectory>
+		</None>
+	</ItemGroup>
+  <ItemGroup>
+    <None Update="i18n\**\*.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+</Project>
