@@ -30,8 +30,11 @@ namespace Dating_Reversed
         private const int SafeBaseEventIdSpan = 10_000_000;
         private const int SafeBaseEventIdMaxExclusive = SafeBaseEventIdMin + SafeBaseEventIdSpan;
 
-        // Each bouquet.* dialogue key has this many numbered variants in i18n.
-        private const int DialogueVariantCount = 20;
+        // Upper bound when counting a dialogue key's numbered variants (bouquet.ask.1, bouquet.ask.2, ...).
+        private const int MaxDialogueVariants = 100;
+
+        // SMAPI files i18n/default.json under this locale name.
+        private const string EnglishLocale = "default";
 
         private ModConfig Config = null!;
         private readonly Dictionary<string, int> _npcToEventId = new(StringComparer.Ordinal);
@@ -831,32 +834,79 @@ namespace Dating_Reversed
         private static string Fallback(string value, string defaultValue)
             => string.IsNullOrWhiteSpace(value) ? defaultValue : value;
 
-        private int PickDialogueIndex(string baseKey)
+        private int PickDialogueIndex(string baseKey, int variantCount)
         {
             int index;
-            if (_lastDialogueIndex.TryGetValue(baseKey, out int last))
+            if (variantCount > 1 && _lastDialogueIndex.TryGetValue(baseKey, out int last) && last <= variantCount)
             {
                 // Pick uniformly from the other variants.
-                index = _dialogueRandom.Next(1, DialogueVariantCount);
+                index = _dialogueRandom.Next(1, variantCount);
                 if (index >= last)
                     index++;
             }
             else
             {
-                index = _dialogueRandom.Next(1, DialogueVariantCount + 1);
+                index = _dialogueRandom.Next(1, variantCount + 1);
             }
 
             _lastDialogueIndex[baseKey] = index;
             return index;
         }
 
-        private string SafeI18n(string baseKey)
+        // The locales that make up the player's own language, in SMAPI's fallback order but without English.
+        private string[] GetOwnLocales()
         {
-            int index = PickDialogueIndex(baseKey);
-            string text = Helper.Translation.Get($"{baseKey}.{index}").ToString();
-            if (string.IsNullOrWhiteSpace(text))
-                text = Helper.Translation.Get($"{baseKey}.1").ToString();
-            return text;
+            string locale = string.IsNullOrEmpty(Helper.Translation.Locale) ? "en" : Helper.Translation.Locale;
+            var locales = new List<string> { locale };
+            for (int dash = locale.LastIndexOf('-'); dash > 0; dash = locale.LastIndexOf('-'))
+            {
+                locale = locale[..dash];
+                locales.Add(locale);
+            }
+
+            return locales.ToArray();
+        }
+
+        private int CountVariantsIn(string baseKey, string[] locales)
+        {
+            int count = 0;
+            while (count < MaxDialogueVariants)
+            {
+                IDictionary<string, Translation> byLocale = Helper.Translation.GetInAllLocales($"{baseKey}.{count + 1}");
+                if (!byLocale.Keys.Any(l => locales.Contains(l, StringComparer.OrdinalIgnoreCase)))
+                    break;
+                count++;
+            }
+
+            return count;
+        }
+
+        // Translations can have fewer variants than English. Only count the ones the player's language defines itself,
+        // otherwise SMAPI fills the gaps with English and the scene switches language partway through.
+        private int CountDialogueVariants(string baseKey, bool englishOnly)
+        {
+            int count = englishOnly ? 0 : CountVariantsIn(baseKey, GetOwnLocales());
+            return count > 0 ? count : CountVariantsIn(baseKey, new[] { EnglishLocale });
+        }
+
+        private string GetDialogueText(string key, bool englishOnly)
+        {
+            if (!englishOnly)
+                return Helper.Translation.Get(key).ToString();
+
+            return Helper.Translation.GetInAllLocales(key).TryGetValue(EnglishLocale, out Translation? english)
+                ? english.ToString()
+                : "";
+        }
+
+        private string GetRandomDialogue(string baseKey, bool englishOnly)
+        {
+            int count = CountDialogueVariants(baseKey, englishOnly);
+            if (count == 0)
+                return "";
+
+            string text = GetDialogueText($"{baseKey}.{PickDialogueIndex(baseKey, count)}", englishOnly);
+            return string.IsNullOrWhiteSpace(text) ? GetDialogueText($"{baseKey}.1", englishOnly) : text;
         }
 
         private static string SeasonName(int seasonIndex)
@@ -1145,23 +1195,10 @@ namespace Dating_Reversed
             }
 
             private string GetText(string key, bool englishOnly)
-            {
-                if (!englishOnly)
-                    return _mod.Helper.Translation.Get(key).ToString();
-
-                return _mod.Helper.Translation.GetInAllLocales(key).TryGetValue("", out Translation? english)
-                    ? english.ToString()
-                    : "";
-            }
+                => _mod.GetDialogueText(key, englishOnly);
 
             private string GetRandomLine(string baseKey, bool englishOnly)
-            {
-                if (!englishOnly)
-                    return _mod.SafeI18n(baseKey);
-
-                string text = GetText($"{baseKey}.{_mod.PickDialogueIndex(baseKey)}", englishOnly: true);
-                return string.IsNullOrWhiteSpace(text) ? GetText($"{baseKey}.1", englishOnly: true) : text;
-            }
+                => _mod.GetRandomDialogue(baseKey, englishOnly);
 
             private BouquetScript BuildScript(string npcName, int eventId, bool englishOnly)
             {
