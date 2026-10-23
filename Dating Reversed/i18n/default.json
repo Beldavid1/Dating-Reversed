@@ -26,6 +26,8 @@
   "gmcm.allowMale.tooltip": "If unchecked, male NPCs won’t ask.",
   "gmcm.allowFemale.name": "Allow Female Suitors",
   "gmcm.allowFemale.tooltip": "If unchecked, female NPCs won’t ask.",
+  "gmcm.pauseWhenTaken.name": "Pause While Engaged or Married",
+  "gmcm.pauseWhenTaken.tooltip": "If checked, no bouquet events happen while you’re engaged or married to anyone. Uncheck this if you use a polyamory mod. Roommates don’t count.",
   "gmcm.debugCmds.name": "Enable Debug Commands",
   "gmcm.debugCmds.tooltip": "Enables the 'dr.*' console commands and the debug menu.",
   "gmcm.debugMenuKey.name": "Open Debug Menu Key",

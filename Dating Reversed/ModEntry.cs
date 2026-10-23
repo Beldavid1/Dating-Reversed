@@ -289,6 +289,13 @@ namespace Dating_Reversed
             if (!TryGetTodayNpc(out string npcName))
                 return;
 
+            // Covers an NPC picked before the farmer got engaged, e.g. one waiting on the wedding day.
+            if (IsPausedForFarmerRelationship())
+            {
+                ModData.Remove(DailyNpcKey);
+                return;
+            }
+
             if (!Game1.player.friendshipData.TryGetValue(npcName, out Friendship? friendship))
             {
                 ModData.Remove(DailyNpcKey);
@@ -651,6 +658,9 @@ namespace Dating_Reversed
 
             int monthKey = GetMonthKey();
 
+            if (IsPausedForFarmerRelationship())
+                yield break;
+
             if (!ignoreMonthlyCap)
             {
                 int currentCount = ModData.TryGetValue(BouquetEventsThisMonthKey, out string? countRaw) && int.TryParse(countRaw, out int count)
@@ -702,6 +712,20 @@ namespace Dating_Reversed
             => (npc.Gender == Gender.Male && Config.AllowMaleSuitors)
             || (npc.Gender == Gender.Female && Config.AllowFemaleSuitors)
             || npc.Gender == Gender.Undefined;
+
+        // Checks every relationship rather than just Game1.player.spouse, so multi-spouse mods are covered too.
+        // Roommates (e.g. Krobus) aren't a romance, so they don't count.
+        private static bool IsFarmerEngagedOrMarried()
+        {
+            Farmer player = Game1.player;
+            if (player.team.IsEngaged(player.UniqueMultiplayerID) || player.team.IsMarried(player.UniqueMultiplayerID))
+                return true;
+
+            return player.friendshipData.Values.Any(static f => (f.IsEngaged() || f.IsMarried()) && !f.IsRoommate());
+        }
+
+        private bool IsPausedForFarmerRelationship()
+            => Config.PauseWhileFarmerEngagedOrMarried && IsFarmerEngagedOrMarried();
 
         private bool IsBouquetBlockedByRelationship(string npcName, Friendship friendship)
         {
@@ -970,15 +994,15 @@ namespace Dating_Reversed
                 setValue: value => Config.UseRandomCooldown = value);
 
             _gmcm.AddNumberOption(ModManifest,
-                name: () => "Random Cooldown Min",
-                tooltip: () => "Minimum cooldown days when Random Cooldown is enabled.",
+                name: () => Helper.Translation.Get("gmcm.randomCdMin.name"),
+                tooltip: () => Helper.Translation.Get("gmcm.randomCdMin.tooltip"),
                 getValue: () => Config.RandomCooldownMinDays,
                 setValue: value => Config.RandomCooldownMinDays = Math.Max(1, value),
                 min: 1, max: 112, interval: 1);
 
             _gmcm.AddNumberOption(ModManifest,
-                name: () => "Random Cooldown Max",
-                tooltip: () => "Maximum cooldown days when Random Cooldown is enabled.",
+                name: () => Helper.Translation.Get("gmcm.randomCdMax.name"),
+                tooltip: () => Helper.Translation.Get("gmcm.randomCdMax.tooltip"),
                 getValue: () => Config.RandomCooldownMaxDays,
                 setValue: value => Config.RandomCooldownMaxDays = Math.Max(1, value),
                 min: 1, max: 112, interval: 1);
@@ -998,37 +1022,43 @@ namespace Dating_Reversed
                 min: 0, max: 1000, interval: 50);
 
             _gmcm.AddNumberOption(ModManifest,
-                name: () => "Minimum Eligible Hearts",
-                tooltip: () => "Minimum hearts required before an NPC can initiate a bouquet event.",
+                name: () => Helper.Translation.Get("gmcm.minEligibleHearts.name"),
+                tooltip: () => Helper.Translation.Get("gmcm.minEligibleHearts.tooltip"),
                 getValue: () => Config.MinEligibleHearts,
                 setValue: value => Config.MinEligibleHearts = Math.Clamp(value, 0, 14),
                 min: 0, max: 14, interval: 1);
 
             _gmcm.AddNumberOption(ModManifest,
-                name: () => "Maximum Eligible Hearts",
-                tooltip: () => "Maximum heart threshold exclusive for bouquet eligibility.",
+                name: () => Helper.Translation.Get("gmcm.maxEligibleHearts.name"),
+                tooltip: () => Helper.Translation.Get("gmcm.maxEligibleHearts.tooltip"),
                 getValue: () => Config.MaxEligibleHeartsExclusive,
                 setValue: value => Config.MaxEligibleHeartsExclusive = Math.Clamp(value, 1, 15),
                 min: 1, max: 15, interval: 1);
 
             _gmcm.AddNumberOption(ModManifest,
-                name: () => "Daily Trigger Chance %",
-                tooltip: () => "Percent chance each eligible day that a bouquet event will be assigned after cooldown is over.",
+                name: () => Helper.Translation.Get("gmcm.dailyTriggerChance.name"),
+                tooltip: () => Helper.Translation.Get("gmcm.dailyTriggerChance.tooltip"),
                 getValue: () => Config.DailyTriggerChancePercent,
                 setValue: value => Config.DailyTriggerChancePercent = Math.Clamp(value, 0, 100),
                 min: 0, max: 100, interval: 1);
 
             _gmcm.AddBoolOption(ModManifest,
-                name: () => "Allow Male Suitors",
-                tooltip: () => "If unchecked, male NPCs won't ask.",
+                name: () => Helper.Translation.Get("gmcm.allowMale.name"),
+                tooltip: () => Helper.Translation.Get("gmcm.allowMale.tooltip"),
                 getValue: () => Config.AllowMaleSuitors,
                 setValue: value => Config.AllowMaleSuitors = value);
 
             _gmcm.AddBoolOption(ModManifest,
-                name: () => "Allow Female Suitors",
-                tooltip: () => "If unchecked, female NPCs won't ask.",
+                name: () => Helper.Translation.Get("gmcm.allowFemale.name"),
+                tooltip: () => Helper.Translation.Get("gmcm.allowFemale.tooltip"),
                 getValue: () => Config.AllowFemaleSuitors,
                 setValue: value => Config.AllowFemaleSuitors = value);
+
+            _gmcm.AddBoolOption(ModManifest,
+                name: () => Helper.Translation.Get("gmcm.pauseWhenTaken.name"),
+                tooltip: () => Helper.Translation.Get("gmcm.pauseWhenTaken.tooltip"),
+                getValue: () => Config.PauseWhileFarmerEngagedOrMarried,
+                setValue: value => Config.PauseWhileFarmerEngagedOrMarried = value);
 
             _gmcm.AddSectionTitle(ModManifest, text: () => Helper.Translation.Get("gmcm.section.npcToggles"));
             AddNpcToggleOptions();
@@ -1050,8 +1080,8 @@ namespace Dating_Reversed
                 setValue: value => Config.EnableDebugCommands = value);
 
             _gmcm.AddKeybindList(ModManifest,
-                name: () => "Open Debug Menu Key",
-                tooltip: () => "Keybind to open the Dating Reversed debug menu (only works when Debug Commands is enabled).",
+                name: () => Helper.Translation.Get("gmcm.debugMenuKey.name"),
+                tooltip: () => Helper.Translation.Get("gmcm.debugMenuKey.tooltip"),
                 getValue: () => Config.OpenDebugMenuKey,
                 setValue: value => Config.OpenDebugMenuKey = value);
 

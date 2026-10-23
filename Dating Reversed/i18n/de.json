@@ -26,6 +26,8 @@
   "gmcm.allowMale.tooltip": "Wenn deaktiviert, fragen männliche NPCs nicht.",
   "gmcm.allowFemale.name": "Weibliche Verehrer zulassen",
   "gmcm.allowFemale.tooltip": "Wenn deaktiviert, fragen weibliche NPCs nicht.",
+  "gmcm.pauseWhenTaken.name": "Pause bei Verlobung oder Ehe",
+  "gmcm.pauseWhenTaken.tooltip": "Wenn aktiviert, gibt es keine Blumenstrauß-Ereignisse, solange du verlobt oder verheiratet bist. Deaktiviere dies, wenn du eine Polyamorie-Mod nutzt. Wohngemeinschaften zählen nicht.",
   "gmcm.debugCmds.name": "Debug-Befehle aktivieren",
   "gmcm.debugCmds.tooltip": "Schaltet die 'dr.*'-Konsolenbefehle und das Debug-Menü frei.",
   "gmcm.debugMenuKey.name": "Taste für Debug-Menü",

@@ -41,6 +41,9 @@ namespace Dating_Reversed
         /// <summary>If true, single female NPCs may initiate bouquet events.</summary>
         public bool AllowFemaleSuitors { get; set; } = true;
 
+        /// <summary>If true, no bouquet events happen while the farmer is engaged or married to anyone (roommates don't count).</summary>
+        public bool PauseWhileFarmerEngagedOrMarried { get; set; } = true;
+
         /***************
          * Eligibility / trigger pacing
          ***************/
