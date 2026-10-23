@@ -1,7 +1,7 @@
 {
   "Name": "Dating Reversed",
   "Author": "Beldavid",
-  "Version": "5.6.1",
+  "Version": "5.7.0",
   "Description": "Sets an NPC's relationship to Dating after your custom bouquet event.",
   "UniqueID": "DatingReversed",
   "EntryDll": "DatingReversed.dll",
