@@ -42,12 +42,23 @@ namespace Dating_Reversed
         private TextButton _btnClose = null!;
         private readonly List<TextButton> _buttons = new();
 
-        private const string Title = "Dating Reversed";
+        // Space between a button's edge and its label (9-slice border is 12px, plus a margin).
+        private const int ButtonTextPad = 20;
+
+        private readonly string _title;
+        private readonly string _noneDisplay;
+        private readonly string _showAllLabel;
+        private readonly string _pickLabel;
 
         public DrDebugMenu(ModEntry mod)
             : base(0, 0, 0, 0, showUpperRightCloseButton: true)
         {
             _mod = mod;
+
+            _title = T("debugMenu.title");
+            _noneDisplay = T("debugMenu.none");
+            _showAllLabel = T("debugMenu.showAllDateables");
+            _pickLabel = T("debugMenu.pick");
 
             ReloadNames();
 
@@ -59,18 +70,19 @@ namespace Dating_Reversed
 
         private const int CheckBoxSize = 36;
         private const string NoneValue = "<none>";
-        private const string NoneDisplay = "None";
         private bool _showAllDateables;
         private ClickableComponent _chkLabel = null!;
         private Vector2 _chkTextPos;
-        private const string ShowAllLabel = "Show all dateables";
         private Rectangle _chkBounds;
         private static readonly Rectangle CheckBoxEmptySrc = new Rectangle(227, 425, 9, 9);
         private static readonly Rectangle CheckBoxCheckedSrc = new Rectangle(236, 425, 9, 9);
         private const float CheckBoxScale = 4f; // 9*4=36px
 
-        private static string Disp(string s)
-            => string.IsNullOrWhiteSpace(s) || s == NoneValue ? NoneDisplay : s;
+        private string T(string key, object? tokens = null)
+            => _mod.Helper.Translation.Get(key, tokens).ToString();
+
+        private string Disp(string s)
+            => string.IsNullOrWhiteSpace(s) || s == NoneValue ? _noneDisplay : s;
 
         private static string GetNpcDisplayName(string rawName)
         {
@@ -104,8 +116,8 @@ namespace Dating_Reversed
             return 1;
         }
 
-        private static string GetDisplayNameForRaw(string rawName)
-            => rawName == NoneValue ? NoneDisplay : GetNpcDisplayName(rawName);
+        private string GetDisplayNameForRaw(string rawName)
+            => rawName == NoneValue ? _noneDisplay : GetNpcDisplayName(rawName);
 
         private void ReloadNames()
         {
@@ -134,10 +146,10 @@ namespace Dating_Reversed
                 .ToList();
 
             if (_choices.Count == 0)
-                _choices.Add((NoneValue, NoneDisplay));
+                _choices.Add((NoneValue, _noneDisplay));
 
             if (!_choices.Any(static p => p.Raw == NoneValue))
-                _choices.Insert(0, (NoneValue, NoneDisplay));
+                _choices.Insert(0, (NoneValue, _noneDisplay));
 
             if (!_choices.Any(p => string.Equals(p.Raw, _selectedRaw, StringComparison.Ordinal)))
                 _selectedRaw = NoneValue;
@@ -151,11 +163,23 @@ namespace Dating_Reversed
             const int pad = 16;
             const int gap = 12;
 
-            int titleW = SpriteText.getWidthOfString(Title);
-            width = Math.Max(680, titleW + pad * 2);
+            string[] row1Labels = { T("debugMenu.button.setToday"), T("debugMenu.button.repick"), T("debugMenu.button.playNow") };
+            string[] row2Labels = { T("debugMenu.button.clearToday"), T("debugMenu.button.stopEvent"), T("debugMenu.button.clearCooldown"), T("debugMenu.button.close") };
+
+            // Buttons share a row equally, so size the menu so the longest label in each row fits.
+            static int RowWidth(string[] labels, int gap)
+            {
+                int widest = (int)Math.Ceiling(labels.Max(static l => Game1.smallFont.MeasureString(l).X));
+                return labels.Length * (widest + ButtonTextPad * 2) + gap * (labels.Length - 1);
+            }
+
+            int titleW = SpriteText.getWidthOfString(_title);
+            int checkboxRowW = CheckBoxSize + 10 + (int)Math.Ceiling(Game1.smallFont.MeasureString(_showAllLabel).X);
+            int contentNeeded = new[] { titleW, checkboxRowW, RowWidth(row1Labels, gap), RowWidth(row2Labels, gap) }.Max();
+            width = Math.Max(680, contentNeeded + pad * 2);
             width = Math.Min(width, Game1.uiViewport.Width - 128);
 
-            int titleH = SpriteText.getHeightOfString(Title);
+            int titleH = SpriteText.getHeightOfString(_title);
             int lineH = (int)Game1.smallFont.MeasureString("Today: Sophia").Y;
 
             const int chkSize = 36;
@@ -200,7 +224,7 @@ namespace Dating_Reversed
             _chkTextPos = new Vector2(contentX + CheckBoxSize + 10, y + 6);
             _chkLabel = new ClickableComponent(
                 new Rectangle(contentX, y, contentW, CheckBoxSize),
-                ShowAllLabel
+                _showAllLabel
             );
 
             y += CheckBoxSize + 10;
@@ -226,18 +250,18 @@ namespace Dating_Reversed
 
             // row 1: 3 columns
             LayoutRow(y, cols: 3, contentX, contentW, gap, buttonH,
-                _btnSetToday = new TextButton(Rectangle.Empty, "Set Today", () =>
+                _btnSetToday = new TextButton(Rectangle.Empty, row1Labels[0], () =>
                 {
                     if (_selectedRaw != NoneValue)
                         _mod.UiSetTodayNpc(_selectedRaw);
                 }),
-                _btnRepick = new TextButton(Rectangle.Empty, "Repick", () =>
+                _btnRepick = new TextButton(Rectangle.Empty, row1Labels[1], () =>
                 {
                     _mod.UiRepick();
                     var t = _mod.UiGetTodayNpc();
                     _selectedRaw = string.IsNullOrWhiteSpace(t) ? NoneValue : t;
                 }),
-                _btnPlayNow = new TextButton(Rectangle.Empty, "Play Now", () =>
+                _btnPlayNow = new TextButton(Rectangle.Empty, row1Labels[2], () =>
                 {
                     if (_selectedRaw != NoneValue)
                         _mod.UiSetTodayNpc(_selectedRaw);
@@ -250,20 +274,20 @@ namespace Dating_Reversed
 
             // row 2: 4 columns
             LayoutRow(y, cols: 4, contentX, contentW, gap, buttonH,
-                _btnClearToday = new TextButton(Rectangle.Empty, "Clear Today", () =>
+                _btnClearToday = new TextButton(Rectangle.Empty, row2Labels[0], () =>
                 {
                     _mod.UiClearTodayNpc();
                     _selectedRaw = NoneValue;
                 }),
-                _btnStopEvent = new TextButton(Rectangle.Empty, "Stop Event", () =>
+                _btnStopEvent = new TextButton(Rectangle.Empty, row2Labels[1], () =>
                 {
                     _mod.UiStopCurrentEvent();
                 }),
-                _btnClearCd = new TextButton(Rectangle.Empty, "Clear CD", () =>
+                _btnClearCd = new TextButton(Rectangle.Empty, row2Labels[2], () =>
                 {
                     _mod.UiClearCooldown();
                 }),
-                _btnClose = new TextButton(Rectangle.Empty, "Close", () =>
+                _btnClose = new TextButton(Rectangle.Empty, row2Labels[3], () =>
                 {
                     Game1.playSound("bigDeSelect");
                     exitThisMenu();
@@ -530,17 +554,17 @@ namespace Dating_Reversed
             );
 
             // title
-            int titleW = SpriteText.getWidthOfString(Title);
+            int titleW = SpriteText.getWidthOfString(_title);
             int titleX = xPositionOnScreen + (width - titleW) / 2;
             int titleY = yPositionOnScreen + 16;
-            SpriteText.drawString(b, Title, titleX, titleY);
+            SpriteText.drawString(b, _title, titleX, titleY);
 
             // today line
             string today = _mod.UiGetTodayNpc();
-            Utility.drawTextWithShadow(b, $"Today: {Disp(GetDisplayNameForRaw(today))}", Game1.smallFont, _todayPos, Game1.textColor);
+            Utility.drawTextWithShadow(b, T("debugMenu.today", new { name = Disp(GetDisplayNameForRaw(today)) }), Game1.smallFont, _todayPos, Game1.textColor);
 
             // pick label
-            Utility.drawTextWithShadow(b, "Pick:", Game1.smallFont, _pickPos, Game1.textColor);
+            Utility.drawTextWithShadow(b, _pickLabel, Game1.smallFont, _pickPos, Game1.textColor);
 
             // checkbox
             b.Draw(
@@ -572,7 +596,7 @@ namespace Dating_Reversed
 
             Utility.drawTextWithShadow(
                 b,
-                ShowAllLabel,
+                _showAllLabel,
                 Game1.smallFont,
                 _chkTextPos,
                 Game1.textColor
@@ -660,7 +684,7 @@ namespace Dating_Reversed
                 }
 
                 int footerY = listRect.Bottom - footerH - 6;
-                string footer = $"{Math.Min(_dropdownScroll + visible, _choices.Count)}/{_choices.Count}";
+                string footer = T("debugMenu.footer", new { shown = Math.Min(_dropdownScroll + visible, _choices.Count), total = _choices.Count });
                 Vector2 fSize = Game1.smallFont.MeasureString(footer);
 
                 Utility.drawTextWithShadow(
@@ -706,7 +730,10 @@ namespace Dating_Reversed
                 if (Hovered && Enabled)
                     b.Draw(Game1.fadeToBlackRect, Bounds, Color.White * 0.08f);
 
+                // The menu is sized to fit every label, but on a very narrow screen shrink the text rather than overflow.
                 Vector2 size = Game1.smallFont.MeasureString(Label);
+                float textScale = size.X > 0 ? Math.Min(1f, (Bounds.Width - ButtonTextPad * 2) / size.X) : 1f;
+                size *= textScale;
                 float tx = Bounds.Center.X - size.X / 2f;
                 float ty = Bounds.Center.Y - size.Y / 2f;
 
@@ -715,7 +742,8 @@ namespace Dating_Reversed
                     Label,
                     Game1.smallFont,
                     new Vector2(tx, ty),
-                    Enabled ? Game1.textColor : (Game1.textColor * 0.6f));
+                    Enabled ? Game1.textColor : (Game1.textColor * 0.6f),
+                    textScale);
             }
         }
     }
