@@ -1,144 +1,64 @@
 ﻿using GenericModConfigMenu;
-using GenericModConfigMenu.Framework;
-using Microsoft.Xna.Framework;
 using StardewModdingAPI;
 using StardewModdingAPI.Events;
+using StardewModdingAPI.Utilities;
 using StardewValley;
 using StardewValley.Characters;
 using StardewValley.Locations;
-using StardewValley.Menus;
 using StardewValley.Mods;
-using StardewValley.Objects;
-using StardewValley.TerrainFeatures;
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Numerics;
 
 namespace Dating_Reversed
 {
     public sealed class ModEntry : Mod
     {
-        // ────────── mod-data keys ──────────
         private const string DailyNpcKey = "DatingReversed/DailyNpc";
         private const string BouquetEventsThisMonthKey = "DatingReversed/BouquetEventsThisMonth";
         private const string BouquetEventMonthKey = "DatingReversed/BouquetEventMonth";
         private const string CooldownDayKey = "DatingReversed/BouquetCooldownUntil";
-        private string SeenThisMonthKey(string npc, int month) => $"DatingReversed/Seen/{npc}/{month}";
-        private const int EligibleMin = 2000;          // inclusive
-        private const int EligibleMaxExclusive = 2300; // exclusive
+        private const string EventIdPrefix = "DatingReversed/EventId/";
+        private const int PointsPerHeart = 250;
+        private const int EligibleMinHearts = 8;
+        private const int EligibleMaxHeartsExclusive = 11;
+        private const int EligibleMinPoints = EligibleMinHearts * PointsPerHeart;
+        private const int EligibleMaxExclusivePoints = EligibleMaxHeartsExclusive * PointsPerHeart;
 
-        // ────────── runtime state ──────────
+        // Keep base event IDs in a range where (eventId * 10 + 2) stays within Int32.
+        private const int SafeBaseEventIdMin = 180_000_000;
+        private const int SafeBaseEventIdSpan = 10_000_000;
+        private const int SafeBaseEventIdMaxExclusive = SafeBaseEventIdMin + SafeBaseEventIdSpan;
+
         private ModConfig Config = null!;
-        private readonly Dictionary<string, int> _npcToEventId = new();
-        private readonly HashSet<string> _applied = new();
-        private bool _lateRefreshed;
+        private readonly Dictionary<string, int> _npcToEventId = new(StringComparer.Ordinal);
+        private readonly HashSet<string> _appliedEventOutcomes = new(StringComparer.Ordinal);
+        private readonly Queue<Action> _nextTickQueue = new();
+        private readonly HashSet<string> _addedNpcToggles = new(StringComparer.Ordinal);
 
-        // GMCM
+        private bool _lateRefreshRan;
         private IGenericModConfigMenuApi? _gmcm;
-        private readonly HashSet<string> _addedNpcToggles = new();
+        private bool _gmcmAdvancedAdded;
+        private BouquetEventService? _eventService;
 
         private ModDataDictionary ModData => Game1.player.modData;
 
         public override void Entry(IModHelper helper)
         {
-            Config = helper.ReadConfig<ModConfig>()!;
+            Config = helper.ReadConfig<ModConfig>() ?? new ModConfig();
+            _eventService = new BouquetEventService(this);
+
             helper.Events.GameLoop.GameLaunched += OnGameLaunched;
             helper.Events.GameLoop.SaveLoaded += OnSaveLoaded;
-            helper.Events.Content.AssetRequested += OnAssetRequested;
             helper.Events.GameLoop.DayStarted += OnDayStarted;
             helper.Events.GameLoop.UpdateTicked += OnUpdateTicked;
+
             helper.Events.Player.Warped += OnWarped;
+            helper.Events.Input.ButtonPressed += OnButtonPressed;
         }
 
-        private Action<string, string[]> Guarded(Action<string, string[]> inner)
-        {
-            return (cmd, args) =>
-            {
-                if (!Config.EnableDebugCommands)
-                {
-                    Monitor.Log("Debug commands are disabled. Enable them in GMCM > Advanced > Enable Debug Commands.", LogLevel.Warn);
-                    return;
-                }
-                inner(cmd, args);
-            };
-        }
-
-        private static string Fallback(string s, string def)
-            => string.IsNullOrWhiteSpace(s) ? def : s;
-
-        private string SafeI18n(string baseKey)
-        {
-            int idx = Game1.random.Next(1, 21);
-            string s = Helper.Translation.Get($"{baseKey}.{idx}").ToString();
-            if (string.IsNullOrWhiteSpace(s))
-                s = Helper.Translation.Get($"{baseKey}.1").ToString();
-            return s;
-        }
-        private static string SeasonName(int idx)
-        {
-            switch (idx)
-            {
-                case 0: return "Spring";
-                case 1: return "Summer";
-                case 2: return "Fall";
-                case 3: return "Winter";
-                default: return $"season#{idx}";
-            }
-        }
-
-        private static string FormatEventMonth(string monthStr)
-        {
-            if (!int.TryParse(monthStr, out int m))
-                return "<none>";
-            int y = Math.Max(1, m / 100);
-            int s = m % 100;
-            return $"{SeasonName(s)} (Year {y})";
-        }
-
-        // alias to match your current call sites
-        private static string FormatMonthKey(string monthStr) => FormatEventMonth(monthStr);
-
-        // ─────────────────────────────────────────────────────────────────────────
-        // Asset edit: ensure YES/NO subevents exist in Data/Events/Farm for today
-        // ─────────────────────────────────────────────────────────────────────────
-        private void OnAssetRequested(object? sender, AssetRequestedEventArgs e)
-        {
-            if (!e.NameWithoutLocale.IsEquivalentTo("Data/Events/Farm"))
-                return;
-
-            e.Edit(asset =>
-            {
-                if (!Context.IsWorldReady) return;
-                if (!Context.IsMainPlayer) return;
-                if (!ModData.TryGetValue(DailyNpcKey, out var npc)) return;
-                if (!_npcToEventId.TryGetValue(npc, out var eid)) return;
-
-                string yesId = (eid * 10 + 1).ToString();
-                string noId = (eid * 10 + 2).ToString();
-
-                string Clean(string s) => s.Replace("#", "＃").Replace("\"", "\\\"").Replace("\n", "\\n");
-                string accept = Clean(SafeI18n("bouquet.accept").Replace("@", Game1.player.Name));
-                string reject = Clean(SafeI18n("bouquet.reject").Replace("@", Game1.player.Name));
-
-                var dict = asset.AsDictionary<string, string>().Data;
-
-                dict[yesId] =
-                    $"emote {npc} 20/" +
-                    $"pause 400/" +
-                    $"speak {npc} \"{accept}\"/" +
-                    $"addItem 458/" +
-                    $"addConversationTopic DR_ACCEPT_{eid} 1/end";
-
-                dict[noId] =
-                    $"emote {npc} 28/" +
-                    $"pause 400/" +
-                    $"speak {npc} \"{reject}\"/" +
-                    $"addConversationTopic DR_REJECT_{eid} 1/end";
-
-                Monitor.Log($"[DR] Injected YES {yesId} and NO {noId} for {npc}", LogLevel.Trace);
-            }, AssetEditPriority.Late);
-        }
+        private string SeenThisMonthKey(string npcName, int monthKey)
+            => $"DatingReversed/Seen/{npcName}/{monthKey}";
 
         private void OnGameLaunched(object? sender, GameLaunchedEventArgs e)
         {
@@ -147,413 +67,1003 @@ namespace Dating_Reversed
             RegisterConsoleCommands();
         }
 
+        private string BuildNpcTooltip(string rawName, string displayName)
+        {
+            string gender = GetNpcGenderLabel(rawName, displayName);
+            return $"Allow {displayName} to initiate bouquet events.\n" +
+                   $"Gender: {gender}";
+        }
+
+        private string GetNpcGenderLabel(string rawName, string displayName)
+        {
+            string canonicalName = ResolveCanonicalNpcName(rawName, displayName);
+
+            if (TryGetGenderFromCharacterData(canonicalName, out Gender dataGender))
+                return ToGenderLabel(dataGender);
+
+            if (!string.Equals(canonicalName, rawName, StringComparison.Ordinal)
+                && TryGetGenderFromCharacterData(rawName, out dataGender))
+            {
+                return ToGenderLabel(dataGender);
+            }
+
+            if (!string.Equals(canonicalName, displayName, StringComparison.Ordinal)
+                && TryGetGenderFromCharacterData(displayName, out dataGender))
+            {
+                return ToGenderLabel(dataGender);
+            }
+
+            NPC? npc = ResolveNpcForDisplay(canonicalName, rawName, displayName);
+            if (npc is not null)
+            {
+                if (TryGetGenderFromCharacterData(npc.Name, out dataGender))
+                    return ToGenderLabel(dataGender);
+
+                return ToGenderLabel(npc.Gender);
+            }
+
+            return "Unknown";
+        }
+
+        private string ResolveCanonicalNpcName(string rawName, string displayName)
+        {
+            if (!string.IsNullOrWhiteSpace(rawName) && Game1.characterData.ContainsKey(rawName))
+                return rawName;
+
+            if (!string.IsNullOrWhiteSpace(displayName) && Game1.characterData.ContainsKey(displayName))
+                return displayName;
+
+            string cleanedRawName = GetNpcDisplayName(rawName);
+            if (!string.IsNullOrWhiteSpace(cleanedRawName) && Game1.characterData.ContainsKey(cleanedRawName))
+                return cleanedRawName;
+
+            foreach (string key in Game1.characterData.Keys)
+            {
+                if (string.Equals(GetNpcDisplayName(key), displayName, StringComparison.OrdinalIgnoreCase))
+                    return key;
+            }
+
+            foreach (string key in Config.NpcAllowed.Keys)
+            {
+                if (string.Equals(key, rawName, StringComparison.Ordinal))
+                    return key;
+
+                if (string.Equals(GetNpcDisplayName(key), displayName, StringComparison.OrdinalIgnoreCase))
+                    return key;
+            }
+
+            return rawName;
+        }
+
+        private static bool TryGetGenderFromCharacterData(string npcName, out Gender gender)
+        {
+            gender = Gender.Undefined;
+
+            if (string.IsNullOrWhiteSpace(npcName))
+                return false;
+
+            if (!Game1.characterData.TryGetValue(npcName, out var data) || data is null)
+                return false;
+
+            gender = data.Gender;
+            return true;
+        }
+
+        private static string ToGenderLabel(Gender gender)
+        {
+            return gender switch
+            {
+                Gender.Male => "Male",
+                Gender.Female => "Female",
+                Gender.Undefined => "Other",
+                _ => "Unknown"
+            };
+        }
+
+        private NPC? ResolveNpcForDisplay(string canonicalName, string rawName, string displayName)
+        {
+            return Utility.getAllCharacters().FirstOrDefault(p =>
+                       string.Equals(p.Name, canonicalName, StringComparison.Ordinal)
+                       || string.Equals(p.Name, rawName, StringComparison.Ordinal)
+                       || string.Equals(p.Name, displayName, StringComparison.Ordinal))
+                   ?? Game1.getCharacterFromName(canonicalName, mustBeVillager: false)
+                   ?? Game1.getCharacterFromName(rawName, mustBeVillager: false)
+                   ?? Game1.getCharacterFromName(displayName, mustBeVillager: false);
+        }
+
+        private static string GetNpcDisplayName(string rawName)
+        {
+            if (string.IsNullOrWhiteSpace(rawName))
+                return rawName;
+
+            int dotIndex = rawName.LastIndexOf('.');
+            string tail = dotIndex >= 0 ? rawName[(dotIndex + 1)..] : rawName;
+
+            int underscoreIndex = tail.LastIndexOf('_');
+            if (underscoreIndex >= 0 && underscoreIndex < tail.Length - 1)
+                tail = tail[(underscoreIndex + 1)..];
+
+            return string.IsNullOrWhiteSpace(tail) ? rawName : tail;
+        }
+
         private void OnSaveLoaded(object? sender, SaveLoadedEventArgs e)
         {
             RefreshNpcConfig();
             AddNpcToggleOptions();
+            AddAdvancedGmcmOptions();
             BuildEventIdMap();
             PickDailyBouquetNpc();
         }
 
         private void OnDayStarted(object? sender, DayStartedEventArgs e)
         {
-            if (!Config.EnableMod) return;
-            _applied.Clear();
-            _lateRefreshed = false;
+            if (!Config.EnableMod)
+                return;
 
-            // early pick (may be refined after late refresh)
+            _appliedEventOutcomes.Clear();
+            _lateRefreshRan = false;
+
+            BuildEventIdMap();
             PickDailyBouquetNpc();
 
-            // late refresh once, to catch CP NPCs that spawn after maps load
+            Helper.Events.GameLoop.OneSecondUpdateTicked -= OnOneSecondUpdateTicked;
             Helper.Events.GameLoop.OneSecondUpdateTicked += OnOneSecondUpdateTicked;
         }
 
         private void OnOneSecondUpdateTicked(object? sender, OneSecondUpdateTickedEventArgs e)
         {
-            if (_lateRefreshed) { Helper.Events.GameLoop.OneSecondUpdateTicked -= OnOneSecondUpdateTicked; return; }
-            _lateRefreshed = true;
+            if (!Context.IsWorldReady || _lateRefreshRan)
+            {
+                Helper.Events.GameLoop.OneSecondUpdateTicked -= OnOneSecondUpdateTicked;
+                return;
+            }
+
+            _lateRefreshRan = true;
             Helper.Events.GameLoop.OneSecondUpdateTicked -= OnOneSecondUpdateTicked;
 
-            BuildEventIdMap();
             RefreshNpcConfig();
+            BuildEventIdMap();
             PickDailyBouquetNpc();
         }
 
-        // Accept / Reject topic handler
         private void OnUpdateTicked(object? sender, UpdateTickedEventArgs e)
         {
+            RunNextTickQueue();
+
             if (!Context.IsWorldReady || !Config.EnableMod || Game1.eventUp)
                 return;
 
-            // only process the scheduled suitor for today
-            if (!ModData.TryGetValue(DailyNpcKey, out var todayNpc))
-                return;
-            if (!_npcToEventId.TryGetValue(todayNpc, out var eid))
+            if (!TryGetTodayNpc(out string todayNpc))
                 return;
 
-            string rid = $"DR_REJECT_{eid}";
-            string aid = $"DR_ACCEPT_{eid}";
-            string seid = eid.ToString();
-            int month = GetMonthKey();
+            if (!_npcToEventId.TryGetValue(todayNpc, out int eventId))
+                return;
 
-            // ACCEPTED → dating + cooldown + per-month flag
-            if (Game1.player.activeDialogueEvents.Remove(aid) && _applied.Add(seid))
+            string acceptTopic = $"DR_ACCEPT_{eventId}";
+            string rejectTopic = $"DR_REJECT_{eventId}";
+            string appliedKey = eventId.ToString();
+            int monthKey = GetMonthKey();
+
+            if (Game1.player.activeDialogueEvents.Remove(acceptTopic) && _appliedEventOutcomes.Add(appliedKey))
             {
-                Monitor.Log($"[DR] Consumed {aid} (npc={todayNpc})", LogLevel.Trace);
                 ApplyDating(todayNpc);
                 ApplyCooldownAndCount();
-                ModData[SeenThisMonthKey(todayNpc, month)] = "1";
+                ModData[SeenThisMonthKey(todayNpc, monthKey)] = "1";
                 ModData.Remove(DailyNpcKey);
                 return;
             }
 
-            // REJECTED → penalty + cooldown + per-month flag
-            if (Game1.player.activeDialogueEvents.Remove(rid) && _applied.Add(seid))
+            if (Game1.player.activeDialogueEvents.Remove(rejectTopic) && _appliedEventOutcomes.Add(appliedKey))
             {
-                Monitor.Log($"[DR] Consumed {rid} (npc={todayNpc})", LogLevel.Trace);
                 ApplyRejectionPenalty(todayNpc, Config.RejectPenaltyPoints <= 0 ? 250 : Config.RejectPenaltyPoints);
                 ApplyCooldownAndCount();
-                ModData[SeenThisMonthKey(todayNpc, month)] = "1";
+                ModData[SeenThisMonthKey(todayNpc, monthKey)] = "1";
                 ModData.Remove(DailyNpcKey);
-                return;
             }
-
-            foreach (var key in Game1.player.activeDialogueEvents.Keys.ToList())
-                if (key.StartsWith("DR_ACCEPT_") || key.StartsWith("DR_REJECT_"))
-                    if (!key.EndsWith($"_{eid}"))
-                        Monitor.Log($"[DR] Ignoring stray topic '{key}' (not today's NPC {todayNpc})", LogLevel.Debug);
-
         }
 
-
-        // ─────────────────────────────────────────────────────────────────────────
-        // Farmhouse → Farm one-shot scene. YES forks into the injected subevent.
-        // ─────────────────────────────────────────────────────────────────────────
         private void OnWarped(object? sender, WarpedEventArgs e)
         {
-            if (!e.IsLocalPlayer || !Context.IsWorldReady || Game1.eventUp || !Config.EnableMod)
+            if (!e.IsLocalPlayer || !Context.IsWorldReady || !Context.IsMainPlayer || !Config.EnableMod)
                 return;
-            if (!Context.IsMainPlayer)
+            if (Game1.eventUp || Game1.activeClickableMenu != null)
                 return;
             if (e.OldLocation.Name != "FarmHouse" || e.NewLocation is not Farm)
                 return;
-
-            int time = Game1.timeOfDay;
-            if (time < 600 || time > 1000) // widen while testing if desired
+            if (Game1.timeOfDay < 600 || Game1.timeOfDay > 1000)
+                return;
+            if (_eventService is null)
                 return;
 
-            if (!ModData.TryGetValue(DailyNpcKey, out string npc) ||
-                !_npcToEventId.TryGetValue(npc, out int eid))
+            if (!TryGetTodayNpc(out string npcName))
                 return;
 
-            // do not re-run if this NPC's per-month gate is already set
-            if (ModData.ContainsKey(SeenThisMonthKey(npc, GetMonthKey())))
-                return;
-
-            int px = (int)(Game1.player.Position.X / Game1.tileSize);
-            int py = (int)(Game1.player.Position.Y / Game1.tileSize);
-
-            string Clean(string s) => s.Replace("#", "＃").Replace("\"", "\\\"").Replace("\n", "\\n");
-
-            string ask1 = Clean(SafeI18n("bouquet.ask").Replace("@", Game1.player.Name));
-            string ask2 = Clean(SafeI18n("bouquet.q").Replace("@", Game1.player.Name));
-            string prompt = Clean(Fallback(Helper.Translation.Get("bouquet.prompt").ToString(), "Will you accept this bouquet?"));
-            string yesLabel = Clean(Fallback(Helper.Translation.Get("bouquet.choiceYes").ToString(), "Yes"));
-            string noLabel = Clean(Fallback(Helper.Translation.Get("bouquet.choiceNo").ToString(), "Not right now"));
-            string reject = Clean(SafeI18n("bouquet.reject").Replace("@", Game1.player.Name));
-            string yesId = (eid * 10 + 1).ToString();
-
-            var parts = new[]
+            if (!Game1.player.friendshipData.TryGetValue(npcName, out Friendship? friendship))
             {
-                "none", "-1000 -1000",
-                $"farmer {px} {py} 2 {npc} {px} {py + 1} 0",
-                $"faceDirection {npc} 0",
-                $"faceDirection farmer 2",
-                $"speak {npc} \"{ask1}\"",
-                "pause 80",
-                $"speak {npc} \"{ask2}\"",
-                "pause 80",
-                $"question fork0 \"{prompt}#{yesLabel}#{noLabel}\"",
-                $"fork {yesId}",                 // YES → injected sub-event
-                $"emote {npc} 28",               // NO  → inline branch
-                "pause 400",
-                $"speak {npc} \"{reject}\"",
-                $"addConversationTopic DR_REJECT_{eid} 1",
-                "end"
-            };
+                ModData.Remove(DailyNpcKey);
+                return;
+            }
 
-            string data = string.Join("/", parts);
+            if (IsBouquetBlockedByRelationship(npcName, friendship))
+            {
+                ModData.Remove(DailyNpcKey);
+                return;
+            }
 
-            Helper.GameContent.InvalidateCache("Data/Events/Farm");
-            Helper.GameContent.Load<Dictionary<string, string>>("Data/Events/Farm");
+            if (ModData.ContainsKey(SeenThisMonthKey(npcName, GetMonthKey())))
+                return;
 
-            e.NewLocation.startEvent(new Event(data));
-            Monitor.Log($"\nRAW EVENT >>>\n{data}\n<<< RAW EVENT", LogLevel.Alert);
+            _eventService.TryStartOnCurrentLocation(npcName);
         }
 
-        // ────── Helpers ──────
-        private static int GetMonthKey() => Game1.year * 100 + Game1.seasonIndex;
+        private void OnButtonPressed(object? sender, ButtonPressedEventArgs e)
+        {
+            if (!Context.IsWorldReady || !Config.EnableMod || !Config.EnableDebugCommands)
+                return;
+            if (Game1.eventUp || Game1.activeClickableMenu != null)
+                return;
+            if (!Config.OpenDebugMenuKey.JustPressed())
+                return;
+
+            Helper.Input.SuppressActiveKeybinds(Config.OpenDebugMenuKey);
+            OpenDebugMenu();
+        }
+
+        private void OpenDebugMenu()
+        {
+            Game1.activeClickableMenu = new DrDebugMenu(this);
+        }
+
+        internal void UiRepick()
+        {
+            ModData.Remove(DailyNpcKey);
+            ModData.Remove(CooldownDayKey);
+            PickDailyBouquetNpc();
+            Monitor.Log($"[DR] UI Repick → DailyNpc = {(TryGetTodayNpc(out string npc) ? npc : "<none>")}", LogLevel.Alert);
+        }
+
+        internal void UiClearCooldown()
+        {
+            ModData.Remove(CooldownDayKey);
+            Monitor.Log("[DR] UI cleared cooldown.", LogLevel.Alert);
+        }
+
+        internal string GetTodayNpcName()
+            => TryGetTodayNpc(out string npcName) ? npcName : "<none>";
+
+        internal IReadOnlyList<string> GetDateableNpcNames()
+        {
+            if (_npcToEventId.Count > 0)
+                return _npcToEventId.Keys.OrderBy(static p => p).ToList();
+
+            return Utility.getAllCharacters()
+                .Where(static n => n.datable.Value)
+                .Select(static n => n.Name)
+                .OrderBy(static p => p)
+                .ToList();
+        }
+
+        internal string GetTodayNpc()
+            => GetTodayNpcName();
+
+        internal void ClearTodayNpc()
+        {
+            ModData.Remove(DailyNpcKey);
+        }
+
+        internal void ForceTodayNpc(string npcName, bool clearCooldown = true, bool clearSeenThisMonth = true)
+        {
+            if (_npcToEventId.Count == 0)
+                BuildEventIdMap();
+
+            if (clearCooldown)
+                ModData.Remove(CooldownDayKey);
+
+            if (clearSeenThisMonth)
+                ModData.Remove(SeenThisMonthKey(npcName, GetMonthKey()));
+
+            ModData[DailyNpcKey] = npcName;
+
+            if (_npcToEventId.TryGetValue(npcName, out int eventId))
+                _appliedEventOutcomes.Remove(eventId.ToString());
+
+            Monitor.Log($"[DR] Forced today NPC -> {npcName}", LogLevel.Alert);
+        }
+
+        internal bool TryPickRandomEligibleForToday(out string pickedNpc)
+        {
+            pickedNpc = string.Empty;
+
+            if (!Context.IsWorldReady)
+                return false;
+
+            if (_npcToEventId.Count == 0)
+                BuildEventIdMap();
+
+            List<string> pool = GetEligibleNpcPool(ignoreSeenThisMonth: true, ignoreMonthlyCap: true, ignoreCooldown: true).ToList();
+            if (pool.Count == 0)
+            {
+                Game1.addHUDMessage(new HUDMessage("[DR] No eligible NPCs found."));
+                return false;
+            }
+
+            pickedNpc = pool[Game1.random.Next(pool.Count)];
+            ForceTodayNpc(pickedNpc, clearCooldown: true, clearSeenThisMonth: true);
+            Game1.addHUDMessage(new HUDMessage($"[DR] Picked random eligible NPC: {pickedNpc}"));
+            return true;
+        }
+
+        internal bool TryPlayBouquetNow(string npcName)
+        {
+            if (!Context.IsWorldReady || string.IsNullOrWhiteSpace(npcName) || npcName == "<none>" || _eventService is null)
+                return false;
+
+            if (!_npcToEventId.ContainsKey(npcName))
+                BuildEventIdMap();
+
+            if (!_npcToEventId.ContainsKey(npcName))
+            {
+                Game1.addHUDMessage(new HUDMessage($"[DR] Unknown NPC: {npcName}"));
+                return false;
+            }
+
+            ForceTodayNpc(npcName, clearCooldown: true, clearSeenThisMonth: true);
+
+            if (Game1.currentLocation is not Farm)
+            {
+                Game1.warpFarmer("Farm", 64, 15, false);
+                QueueNextTick(() => _eventService.TryStartOnCurrentLocation(npcName));
+                return true;
+            }
+
+            return _eventService.TryStartOnCurrentLocation(npcName);
+        }
+
+        internal string BuildDebugSummary()
+        {
+            if (!Context.IsWorldReady)
+                return "Load a save first.";
+
+            string dailyNpc = GetTodayNpcName();
+            string eventId = "<n/a>";
+            if (dailyNpc != "<none>" && _npcToEventId.TryGetValue(dailyNpc, out int id))
+                eventId = id.ToString();
+
+            string monthCount = ModData.TryGetValue(BouquetEventsThisMonthKey, out string? count) ? count : "0";
+
+            string cooldown = "none";
+            if (ModData.TryGetValue(CooldownDayKey, out string? cooldownText)
+                && int.TryParse(cooldownText, out int untilDay)
+                && untilDay > Game1.Date.TotalDays)
+            {
+                int remaining = untilDay - Game1.Date.TotalDays;
+                cooldown = $"{remaining} day(s) (until idx {untilDay})";
+            }
+
+            return
+                $"Today NPC: {dailyNpc}\n" +
+                $"Event ID: {eventId}\n" +
+                $"Month count: {monthCount}/{Config.MaxBouquetsPerMonth}\n" +
+                $"Cooldown: {cooldown}\n" +
+                $"Month key: {GetMonthKey()}";
+        }
+
+        internal string UiBuildStatusText()
+        {
+            if (!Context.IsWorldReady)
+                return "Load a save first.";
+
+            string dailyNpc = TryGetTodayNpc(out string npcName) ? npcName : "<none>";
+            string monthCount = ModData.TryGetValue(BouquetEventsThisMonthKey, out string? count) ? count : "0";
+
+            string eventMonth = "<none>";
+            if (ModData.TryGetValue(BouquetEventMonthKey, out string? eventMonthRaw))
+                eventMonth = FormatMonthKey(eventMonthRaw);
+
+            string cooldown = "<none>";
+            if (ModData.TryGetValue(CooldownDayKey, out string? cooldownRaw) && int.TryParse(cooldownRaw, out int untilDay))
+            {
+                int remaining = Math.Max(0, untilDay - Game1.Date.TotalDays);
+                cooldown = remaining > 0 ? $"{remaining} day(s) remaining" : "<none>";
+            }
+
+            return
+                $"Today's NPC: {dailyNpc}\n" +
+                $"Bouquets this month: {monthCount}/{Config.MaxBouquetsPerMonth}\n" +
+                $"Event month: {eventMonth}\n" +
+                $"Cooldown: {cooldown}";
+        }
+
+        internal string UiGetTodayNpc()
+            => GetTodayNpcName();
+
+        internal IEnumerable<string> UiGetEligiblePool(bool includeAllDateables = false)
+        {
+            if (_npcToEventId.Count == 0)
+                BuildEventIdMap();
+
+            if (_npcToEventId.Count == 0)
+                return Enumerable.Empty<string>();
+
+            IEnumerable<string> source = includeAllDateables
+                ? _npcToEventId.Keys
+                : GetEligibleNpcPool(ignoreSeenThisMonth: false, ignoreMonthlyCap: true, ignoreCooldown: true);
+
+            // Reuse GMCM-style dedupe logic
+            var chosen = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (string rawName in source)
+            {
+                string displayName = GetNpcDisplayName(rawName);
+
+                if (!chosen.TryGetValue(displayName, out string? existing))
+                {
+                    chosen[displayName] = rawName;
+                    continue;
+                }
+
+                if (GetNpcToggleNamePriority(rawName, displayName) > GetNpcToggleNamePriority(existing, displayName))
+                    chosen[displayName] = rawName;
+            }
+
+            return chosen
+                .OrderBy(p => p.Key, StringComparer.OrdinalIgnoreCase)
+                .Select(p => p.Value)
+                .ToList();
+        }
+        internal IEnumerable<string> UiGetEligiblePool()
+            => UiGetEligiblePool(includeAllDateables: true);
+
+        internal void UiSetTodayNpc(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name) || name == "<none>")
+            {
+                UiClearTodayNpc();
+                return;
+            }
+
+            ForceTodayNpc(name, clearCooldown: false, clearSeenThisMonth: true);
+            Monitor.Log($"[DR] UI SetToday → {name}", LogLevel.Alert);
+        }
+
+        internal void UiClearTodayNpc()
+        {
+            ModData.Remove(DailyNpcKey);
+            Monitor.Log("[DR] UI cleared today NPC.", LogLevel.Alert);
+        }
+
+        internal void UiStopCurrentEvent()
+        {
+            if (!Context.IsWorldReady || !Game1.eventUp)
+                return;
+
+            try
+            {
+                Game1.currentLocation?.currentEvent?.exitEvent();
+            }
+            catch
+            {
+            }
+
+            Game1.eventUp = false;
+            Game1.player.canMove = true;
+            Game1.freezeControls = false;
+            Monitor.Log("[DR] UI stopped current event.", LogLevel.Alert);
+        }
+
+        internal void UiPlayNow()
+        {
+            if (!Context.IsWorldReady)
+                return;
+
+            string npcName = UiGetTodayNpc();
+            if (npcName == "<none>")
+            {
+                Monitor.Log("[DR] UI PlayNow: no today NPC set.", LogLevel.Warn);
+                return;
+            }
+
+            if (Game1.activeClickableMenu is not null)
+                Game1.exitActiveMenu();
+
+            QueueNextTick(() => TryPlayBouquetNow(npcName));
+        }
+
+        internal void QueueNextTick(Action action)
+        {
+            _nextTickQueue.Enqueue(action);
+        }
+
+        private void RunNextTickQueue()
+        {
+            if (!Context.IsWorldReady)
+                return;
+
+            while (_nextTickQueue.Count > 0)
+            {
+                Action action = _nextTickQueue.Dequeue();
+                try
+                {
+                    action.Invoke();
+                }
+                catch (Exception ex)
+                {
+                    Monitor.Log($"[DR] queued action failed: {ex}", LogLevel.Warn);
+                }
+            }
+        }
+
+        private bool TryGetTodayNpc(out string npcName)
+        {
+            if (ModData.TryGetValue(DailyNpcKey, out string? raw) && !string.IsNullOrWhiteSpace(raw))
+            {
+                npcName = raw;
+                return true;
+            }
+
+            npcName = string.Empty;
+            return false;
+        }
 
         private void RefreshNpcConfig()
         {
-            foreach (var n in Utility.getAllCharacters().Where(n => n.datable.Value))
-                Config.NpcAllowed.TryAdd(n.Name, true);
+            foreach (NPC npc in Utility.getAllCharacters().Where(static n => n.datable.Value))
+                Config.EnsureNpcKey(npc.Name);
+
             Helper.WriteConfig(Config);
         }
 
         private void BuildEventIdMap()
         {
             _npcToEventId.Clear();
-            int next = 92000001;
-            foreach (var n in Utility.getAllCharacters().Where(n => n.datable.Value))
+
+            foreach (NPC npc in Utility.getAllCharacters().Where(static n => n.datable.Value))
             {
-                var key = $"DatingReversed/EventId/{n.Name}";
-                if (!ModData.TryGetValue(key, out var s) || !int.TryParse(s, out var stored))
+                string key = EventIdPrefix + npc.Name;
+                if (!ModData.TryGetValue(key, out string? storedRaw) || !int.TryParse(storedRaw, out int storedId) || !IsSafeBaseEventId(storedId))
                 {
-                    stored = next++;
-                    ModData[key] = stored.ToString();
+                    storedId = MakeBaseId(npc.Name);
+                    ModData[key] = storedId.ToString();
                 }
-                _npcToEventId[n.Name] = stored;
+
+                _npcToEventId[npc.Name] = storedId;
             }
         }
 
-        private bool GenderAllowed(NPC n)
-            => (n.Gender == Gender.Male && Config.AllowMaleSuitors)
-            || (n.Gender == Gender.Female && Config.AllowFemaleSuitors)
-            || n.Gender == Gender.Undefined;
+        private static bool IsSafeBaseEventId(int eventId)
+            => eventId >= SafeBaseEventIdMin && eventId < SafeBaseEventIdMaxExclusive;
+
+        private IEnumerable<string> GetEligibleNpcPool(bool ignoreSeenThisMonth, bool ignoreMonthlyCap, bool ignoreCooldown)
+        {
+            if (!Context.IsWorldReady)
+                yield break;
+
+            int monthKey = GetMonthKey();
+
+            if (!ignoreMonthlyCap)
+            {
+                int currentCount = ModData.TryGetValue(BouquetEventsThisMonthKey, out string? countRaw) && int.TryParse(countRaw, out int count)
+                    ? count
+                    : 0;
+                if (currentCount >= Config.MaxBouquetsPerMonth)
+                    yield break;
+            }
+
+            if (!ignoreCooldown
+                && ModData.TryGetValue(CooldownDayKey, out string? cooldownRaw)
+                && int.TryParse(cooldownRaw, out int untilDay)
+                && untilDay > Game1.Date.TotalDays)
+            {
+                yield break;
+            }
+
+            int minEligibleHearts = Math.Min(Math.Max(0, Config.MinEligibleHearts), 8);
+            int maxEligibleHeartsExclusive = Math.Max(minEligibleHearts + 1, Config.MaxEligibleHeartsExclusive);
+            int minEligiblePoints = minEligibleHearts * PointsPerHeart;
+            int maxEligiblePointsExclusive = maxEligibleHeartsExclusive * PointsPerHeart;
+
+            foreach ((string npcName, _) in _npcToEventId)
+            {
+                NPC? npc = Game1.getCharacterFromName(npcName);
+                if (npc is null)
+                    continue;
+                if (!GenderAllowed(npc))
+                    continue;
+                if (!Config.NpcAllowed.TryGetValue(npcName, out bool allowed) || !allowed)
+                    continue;
+                if (!Game1.player.friendshipData.TryGetValue(npcName, out Friendship? friendship))
+                    continue;
+                if (friendship.Points < minEligiblePoints || friendship.Points >= maxEligiblePointsExclusive)
+                    continue;
+                if (IsBouquetBlockedByRelationship(npcName, friendship))
+                    continue;
+                if (!ignoreSeenThisMonth && ModData.ContainsKey(SeenThisMonthKey(npcName, monthKey)))
+                    continue;
+
+                yield return npcName;
+            }
+        }
+
+        private static int GetMonthKey()
+            => Game1.year * 100 + Game1.seasonIndex;
+
+        private bool GenderAllowed(NPC npc)
+            => (npc.Gender == Gender.Male && Config.AllowMaleSuitors)
+            || (npc.Gender == Gender.Female && Config.AllowFemaleSuitors)
+            || npc.Gender == Gender.Undefined;
+
+        private bool IsBouquetBlockedByRelationship(string npcName, Friendship friendship)
+        {
+            if (friendship.Status == FriendshipStatus.Dating
+                || friendship.Status == FriendshipStatus.Engaged
+                || friendship.Status == FriendshipStatus.Married)
+            {
+                return true;
+            }
+
+            if (friendship.RoommateMarriage)
+                return true;
+
+            if (!string.IsNullOrEmpty(Game1.player.spouse)
+                && string.Equals(Game1.player.spouse, npcName, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            return false;
+        }
 
         private void PickDailyBouquetNpc()
         {
-            if (!Config.EnableMod) return;
+            if (!Config.EnableMod || !Context.IsWorldReady)
+                return;
 
-            var d = ModData;
             int today = Game1.Date.TotalDays;
-            int month = GetMonthKey();
+            int monthKey = GetMonthKey();
 
-            // 1) MONTH ROLL-OVER FIRST (even if we're on cooldown)
-            if (!d.TryGetValue(BouquetEventMonthKey, out var monthStr)
-                || !int.TryParse(monthStr, out var lastMonth)
-                || lastMonth != month)
+            if (!ModData.TryGetValue(BouquetEventMonthKey, out string? monthRaw)
+                || !int.TryParse(monthRaw, out int storedMonth)
+                || storedMonth != monthKey)
             {
-                d[BouquetEventMonthKey] = month.ToString();
-                d[BouquetEventsThisMonthKey] = "0";
-                // optional: prune old "Seen" keys if you want
-                foreach (var k in d.Keys.Where(k => k.StartsWith("DatingReversed/Seen/", StringComparison.Ordinal)).ToList())
-                d.Remove(k);
+                ModData[BouquetEventMonthKey] = monthKey.ToString();
+                ModData[BouquetEventsThisMonthKey] = "0";
+
+                foreach (string key in ModData.Keys.Where(static key => key.StartsWith("DatingReversed/Seen/", StringComparison.Ordinal)).ToArray())
+                    ModData.Remove(key);
             }
 
-            // 2) COOLDOWN GATE
-            if (d.TryGetValue(CooldownDayKey, out var cds)
-                && int.TryParse(cds, out var until)
-                && until > today)
+            if (ModData.TryGetValue(CooldownDayKey, out string? cooldownRaw)
+                && int.TryParse(cooldownRaw, out int untilDay)
+                && untilDay > today)
             {
-                d.Remove(DailyNpcKey);
+                ModData.Remove(DailyNpcKey);
                 return;
             }
 
-            // 3) Reuse today's pick if still valid & unseen
-            if (d.TryGetValue(DailyNpcKey, out var existing)
-                && _npcToEventId.ContainsKey(existing)
-                && !d.ContainsKey(SeenThisMonthKey(existing, month)))
+            if (TryGetTodayNpc(out string existingNpc)
+                && _npcToEventId.ContainsKey(existingNpc)
+                && !ModData.ContainsKey(SeenThisMonthKey(existingNpc, monthKey)))
             {
-                return; // AssetRequested will inject YES when Farm events are requested
+                return;
             }
 
-            d.Remove(DailyNpcKey);
+            ModData.Remove(DailyNpcKey);
 
-            // 4) Monthly cap
-            int count = (d.TryGetValue(BouquetEventsThisMonthKey, out var cs) && int.TryParse(cs, out var c)) ? c : 0;
-            if (count >= Config.MaxBouquetsPerMonth) return;
+            int dailyTriggerChancePercent = Math.Clamp(Config.DailyTriggerChancePercent, 0, 100);
+            if (dailyTriggerChancePercent <= 0)
+                return;
 
-            // 5) Build candidate pool
-            var pool = new List<string>();
-            foreach (var name in _npcToEventId.Keys)
-            {
-                var npcChar = Game1.getCharacterFromName(name);
-                if (npcChar is null
-                    || !GenderAllowed(npcChar)
-                    || !Config.NpcAllowed.TryGetValue(name, out var ok) || !ok
-                    || !Game1.player.friendshipData.TryGetValue(name, out var fs)
-                    || fs.Points < EligibleMin || fs.Points >= EligibleMaxExclusive
-                    || fs.Status == FriendshipStatus.Dating
-                    || d.ContainsKey(SeenThisMonthKey(name, month)))
-                    continue;
+            if (dailyTriggerChancePercent < 100 && Game1.random.Next(100) >= dailyTriggerChancePercent)
+                return;
 
-                pool.Add(name);
-            }
+            List<string> pool = GetEligibleNpcPool(ignoreSeenThisMonth: false, ignoreMonthlyCap: false, ignoreCooldown: true).ToList();
+            if (pool.Count == 0)
+                return;
 
-            if (!pool.Any()) return;
-            d[DailyNpcKey] = pool[Game1.random.Next(pool.Count)];
+            ModData[DailyNpcKey] = pool[Game1.random.Next(pool.Count)];
         }
 
-        private void ApplyDating(string npc)
+        private void ApplyDating(string npcName)
         {
-            if (!Game1.player.friendshipData.TryGetValue(npc, out var fs))
+            if (!Game1.player.friendshipData.TryGetValue(npcName, out Friendship? friendship))
+                return;
+            if (IsBouquetBlockedByRelationship(npcName, friendship))
                 return;
 
-            // don't drop points; just ensure they aren't below the lower bound
-            if (fs.Points < EligibleMin)
-                fs.Points = EligibleMin;
+            int minEligibleHearts = Math.Min(Math.Max(0, Config.MinEligibleHearts), 8);
+            int minEligiblePoints = minEligibleHearts * PointsPerHeart;
+            if (friendship.Points < minEligiblePoints)
+                friendship.Points = minEligiblePoints;
 
-            fs.Status = FriendshipStatus.Dating;
+            friendship.Status = FriendshipStatus.Dating;
         }
 
         private void ApplyCooldownAndCount()
         {
-            int cnt = ModData.TryGetValue(BouquetEventsThisMonthKey, out var s)
-                      && int.TryParse(s, out var c) ? c : 0;
-            ModData[BouquetEventsThisMonthKey] = (cnt + 1).ToString();
+            int currentCount = ModData.TryGetValue(BouquetEventsThisMonthKey, out string? countRaw) && int.TryParse(countRaw, out int count)
+                ? count
+                : 0;
+            ModData[BouquetEventsThisMonthKey] = (currentCount + 1).ToString();
 
-            int cd = Config.UseRandomCooldown
-                   ? Game1.random.Next(1, 10)
-                   : Config.FixedCooldownDays;
-            ModData[CooldownDayKey] = (Game1.Date.TotalDays + cd).ToString();
+            int cooldownDays;
+            if (Config.UseRandomCooldown)
+            {
+                int minCooldownDays = Math.Max(1, Config.RandomCooldownMinDays);
+                int maxCooldownDays = Math.Max(minCooldownDays, Config.RandomCooldownMaxDays);
+                cooldownDays = Game1.random.Next(minCooldownDays, maxCooldownDays + 1);
+            }
+            else
+            {
+                cooldownDays = Math.Max(1, Config.FixedCooldownDays);
+            }
+
+            ModData[CooldownDayKey] = (Game1.Date.TotalDays + cooldownDays).ToString();
         }
 
-        private void ApplyRejectionPenalty(string npc, int amount = 250)
+        private void ApplyRejectionPenalty(string npcName, int amount = 250)
         {
-            if (!Game1.player.friendshipData.TryGetValue(npc, out var fs))
+            if (!Game1.player.friendshipData.TryGetValue(npcName, out Friendship? friendship))
                 return;
 
-            int before = fs.Points;
-            fs.Points = Math.Max(0, fs.Points - amount);
-            Monitor.Log($"Rejected bouquet from {npc}: -{amount} points ( {before} → {fs.Points} )", LogLevel.Trace);
+            friendship.Points = Math.Max(0, friendship.Points - amount);
         }
 
-        // ────────── GMCM ──────────
-        // builds the status text shown in GMCM
-        private string BuildStatusForGmcm()
+        private int MakeBaseId(string npcName)
         {
-            var d = ModData;
-            string L(string k) => Helper.Translation.Get(k).ToString();
-            string none = L("gmcm.status.none");
-
-            string dailyNpc = d.TryGetValue(DailyNpcKey, out var dn) ? dn : none;
-            string monthCount = d.TryGetValue(BouquetEventsThisMonthKey, out var mc) ? mc : none;
-
-            string eventMonth;
-            if (d.TryGetValue(BouquetEventMonthKey, out var em) && int.TryParse(em, out int m))
+            unchecked
             {
-                int y = Math.Max(1, m / 100);
-                int s = m % 100;
-                eventMonth = $"{SeasonName(s)} (Year {y}) [{em}]";
-            }
-            else eventMonth = none;
+                int hash = $"{ModManifest.UniqueID}:{npcName}".GetHashCode();
+                if (hash < 0)
+                    hash = -hash;
 
-            string cooldown;
-            if (d.TryGetValue(CooldownDayKey, out var cds) && int.TryParse(cds, out var until))
-            {
-                int remaining = Math.Max(0, until - Game1.Date.TotalDays);
-                cooldown = remaining > 0 ? $"{remaining} day(s) remaining (until idx {until})" : none;
+                return SafeBaseEventIdMin + (hash % SafeBaseEventIdSpan);
             }
-            else cooldown = none;
-
-            return $"{L("gmcm.status.dailyNpc")}: {dailyNpc}\n" +
-                   $"{L("gmcm.status.monthCount")}: {monthCount}\n" +
-                   $"{L("gmcm.status.eventMonth")}: {eventMonth}\n" +
-                   $"{L("gmcm.status.cooldown")}: {cooldown}";
         }
+
+        private static string Fallback(string value, string defaultValue)
+            => string.IsNullOrWhiteSpace(value) ? defaultValue : value;
+
+        private string SafeI18n(string baseKey)
+        {
+            int index = Game1.random.Next(1, 21);
+            string text = Helper.Translation.Get($"{baseKey}.{index}").ToString();
+            if (string.IsNullOrWhiteSpace(text))
+                text = Helper.Translation.Get($"{baseKey}.1").ToString();
+            return text;
+        }
+
+        private static string SeasonName(int seasonIndex)
+        {
+            return seasonIndex switch
+            {
+                0 => "Spring",
+                1 => "Summer",
+                2 => "Fall",
+                3 => "Winter",
+                _ => $"season#{seasonIndex}"
+            };
+        }
+
+        private static string FormatEventMonth(string monthStr)
+        {
+            if (!int.TryParse(monthStr, out int month))
+                return "<none>";
+
+            int year = Math.Max(1, month / 100);
+            int season = month % 100;
+            return $"{SeasonName(season)} (Year {year})";
+        }
+
+        private static string FormatMonthKey(string monthStr)
+            => FormatEventMonth(monthStr);
 
         private void SetupGmcm()
-{
-    var api = Helper.ModRegistry.GetApi<IGenericModConfigMenuApi>("spacechase0.GenericModConfigMenu");
-    if (api is null) return;
-    _gmcm = api;
+        {
+            _gmcm = Helper.ModRegistry.GetApi<IGenericModConfigMenuApi>("spacechase0.GenericModConfigMenu");
+            if (_gmcm is null)
+                return;
 
-    _gmcm.Register(
-        mod: ModManifest,
-        reset: () => { Config = new ModConfig(); RefreshNpcConfig(); },
-        save: () => Helper.WriteConfig(Config)
-    );
+            _gmcm.Register(
+                mod: ModManifest,
+                reset: () =>
+                {
+                    Config = new ModConfig();
+                    RefreshNpcConfig();
+                },
+                save: () => Helper.WriteConfig(Config)
+            );
 
-    _gmcm.AddBoolOption(ModManifest,
-        name:    () => Helper.Translation.Get("gmcm.enableMod.name"),
-        tooltip: () => Helper.Translation.Get("gmcm.enableMod.tooltip"),
-        getValue: () => Config.EnableMod,
-        setValue:  v => Config.EnableMod = v
-    );
+            _gmcm.AddBoolOption(ModManifest,
+                name: () => Helper.Translation.Get("gmcm.enableMod.name"),
+                tooltip: () => Helper.Translation.Get("gmcm.enableMod.tooltip"),
+                getValue: () => Config.EnableMod,
+                setValue: value => Config.EnableMod = value);
 
-    _gmcm.AddNumberOption(ModManifest,
-        name:    () => Helper.Translation.Get("gmcm.maxPerMonth.name"),
-        tooltip: () => Helper.Translation.Get("gmcm.maxPerMonth.tooltip"),
-        getValue: () => Config.MaxBouquetsPerMonth,
-        setValue:  v => Config.MaxBouquetsPerMonth = Math.Clamp(v, 1, 99),
-        min: 1, max: 20, interval: 1
-    );
+            _gmcm.AddNumberOption(ModManifest,
+                name: () => Helper.Translation.Get("gmcm.maxPerMonth.name"),
+                tooltip: () => Helper.Translation.Get("gmcm.maxPerMonth.tooltip"),
+                getValue: () => Config.MaxBouquetsPerMonth,
+                setValue: value => Config.MaxBouquetsPerMonth = Math.Clamp(value, 1, 99),
+                min: 1, max: 20, interval: 1);
 
-    _gmcm.AddBoolOption(ModManifest,
-        name:    () => Helper.Translation.Get("gmcm.randomCd.name"),
-        tooltip: () => Helper.Translation.Get("gmcm.randomCd.tooltip"),
-        getValue: () => Config.UseRandomCooldown,
-        setValue:  v => Config.UseRandomCooldown = v
-    );
+            _gmcm.AddBoolOption(ModManifest,
+                name: () => Helper.Translation.Get("gmcm.randomCd.name"),
+                tooltip: () => Helper.Translation.Get("gmcm.randomCd.tooltip"),
+                getValue: () => Config.UseRandomCooldown,
+                setValue: value => Config.UseRandomCooldown = value);
 
-    _gmcm.AddNumberOption(ModManifest,
-        name:    () => Helper.Translation.Get("gmcm.fixedCd.name"),
-        tooltip: () => Helper.Translation.Get("gmcm.fixedCd.tooltip"),
-        getValue: () => Config.FixedCooldownDays,
-        setValue:  v => Config.FixedCooldownDays = Math.Clamp(v, 1, 9),
-        min: 1, max: 9, interval: 1
-    );
+            _gmcm.AddNumberOption(ModManifest,
+                name: () => "Random Cooldown Min",
+                tooltip: () => "Minimum cooldown days when Random Cooldown is enabled.",
+                getValue: () => Config.RandomCooldownMinDays,
+                setValue: value => Config.RandomCooldownMinDays = Math.Max(1, value),
+                min: 1, max: 112, interval: 1);
 
-    _gmcm.AddNumberOption(ModManifest,
-        name:    () => Helper.Translation.Get("gmcm.rejectPenalty.name"),
-        tooltip: () => Helper.Translation.Get("gmcm.rejectPenalty.tooltip"),
-        getValue: () => Config.RejectPenaltyPoints,
-        setValue:  v => Config.RejectPenaltyPoints = Math.Clamp(v, 0, 1000),
-        min: 0, max: 1000, interval: 50
-    );
+            _gmcm.AddNumberOption(ModManifest,
+                name: () => "Random Cooldown Max",
+                tooltip: () => "Maximum cooldown days when Random Cooldown is enabled.",
+                getValue: () => Config.RandomCooldownMaxDays,
+                setValue: value => Config.RandomCooldownMaxDays = Math.Max(1, value),
+                min: 1, max: 112, interval: 1);
 
-    _gmcm.AddSectionTitle(ModManifest, text: () => Helper.Translation.Get("gmcm.section.liveStatus"));
-    _gmcm.AddParagraph  (ModManifest, text: () => BuildStatusForGmcm());
+            _gmcm.AddNumberOption(ModManifest,
+                name: () => Helper.Translation.Get("gmcm.fixedCd.name"),
+                tooltip: () => Helper.Translation.Get("gmcm.fixedCd.tooltip"),
+                getValue: () => Config.FixedCooldownDays,
+                setValue: value => Config.FixedCooldownDays = Math.Clamp(value, 1, 9),
+                min: 1, max: 9, interval: 1);
 
-    _gmcm.AddBoolOption(ModManifest,
-        name:    () => Helper.Translation.Get("gmcm.allowMale.name"),
-        getValue: () => Config.AllowMaleSuitors,
-        setValue:  v => Config.AllowMaleSuitors = v
-    );
+            _gmcm.AddNumberOption(ModManifest,
+                name: () => Helper.Translation.Get("gmcm.rejectPenalty.name"),
+                tooltip: () => Helper.Translation.Get("gmcm.rejectPenalty.tooltip"),
+                getValue: () => Config.RejectPenaltyPoints,
+                setValue: value => Config.RejectPenaltyPoints = Math.Clamp(value, 0, 1000),
+                min: 0, max: 1000, interval: 50);
 
-    _gmcm.AddBoolOption(ModManifest,
-        name:    () => Helper.Translation.Get("gmcm.allowFemale.name"),
-        getValue: () => Config.AllowFemaleSuitors,
-        setValue:  v => Config.AllowFemaleSuitors = v
-    );
+            _gmcm.AddNumberOption(ModManifest,
+                name: () => "Minimum Eligible Hearts",
+                tooltip: () => "Minimum hearts required before an NPC can initiate a bouquet event.",
+                getValue: () => Config.MinEligibleHearts,
+                setValue: value => Config.MinEligibleHearts = Math.Clamp(value, 0, 14),
+                min: 0, max: 14, interval: 1);
 
-    _gmcm.AddSectionTitle(ModManifest, text: () => Helper.Translation.Get("gmcm.section.npcToggles"));
-    AddNpcToggleOptions();
+            _gmcm.AddNumberOption(ModManifest,
+                name: () => "Maximum Eligible Hearts",
+                tooltip: () => "Maximum heart threshold exclusive for bouquet eligibility.",
+                getValue: () => Config.MaxEligibleHeartsExclusive,
+                setValue: value => Config.MaxEligibleHeartsExclusive = Math.Clamp(value, 1, 15),
+                min: 1, max: 15, interval: 1);
 
-    _gmcm.AddSectionTitle(ModManifest, text: () => Helper.Translation.Get("gmcm.section.advanced"));
-    _gmcm.AddBoolOption(ModManifest,
-        name:    () => Helper.Translation.Get("gmcm.debugCmds.name"),
-        tooltip: () => Helper.Translation.Get("gmcm.debugCmds.tooltip"),
-        getValue: () => Config.EnableDebugCommands,
-        setValue:  v => Config.EnableDebugCommands = v
-    );
-}
+            _gmcm.AddNumberOption(ModManifest,
+                name: () => "Daily Trigger Chance %",
+                tooltip: () => "Percent chance each eligible day that a bouquet event will be assigned after cooldown is over.",
+                getValue: () => Config.DailyTriggerChancePercent,
+                setValue: value => Config.DailyTriggerChancePercent = Math.Clamp(value, 0, 100),
+                min: 0, max: 100, interval: 1);
+
+            _gmcm.AddBoolOption(ModManifest,
+                name: () => "Allow Male Suitors",
+                tooltip: () => "If unchecked, male NPCs won't ask.",
+                getValue: () => Config.AllowMaleSuitors,
+                setValue: value => Config.AllowMaleSuitors = value);
+
+            _gmcm.AddBoolOption(ModManifest,
+                name: () => "Allow Female Suitors",
+                tooltip: () => "If unchecked, female NPCs won't ask.",
+                getValue: () => Config.AllowFemaleSuitors,
+                setValue: value => Config.AllowFemaleSuitors = value);
+
+            _gmcm.AddSectionTitle(ModManifest, text: () => Helper.Translation.Get("gmcm.section.npcToggles"));
+            AddNpcToggleOptions();
+
+            if (Context.IsWorldReady)
+                AddAdvancedGmcmOptions();
+        }
+
+        private void AddAdvancedGmcmOptions()
+        {
+            if (_gmcm is null || _gmcmAdvancedAdded)
+                return;
+
+            _gmcm.AddSectionTitle(ModManifest, text: () => Helper.Translation.Get("gmcm.section.advanced"));
+            _gmcm.AddBoolOption(ModManifest,
+                name: () => Helper.Translation.Get("gmcm.debugCmds.name"),
+                tooltip: () => Helper.Translation.Get("gmcm.debugCmds.tooltip"),
+                getValue: () => Config.EnableDebugCommands,
+                setValue: value => Config.EnableDebugCommands = value);
+
+            _gmcm.AddKeybindList(ModManifest,
+                name: () => "Open Debug Menu Key",
+                tooltip: () => "Keybind to open the Dating Reversed debug menu (only works when Debug Commands is enabled).",
+                getValue: () => Config.OpenDebugMenuKey,
+                setValue: value => Config.OpenDebugMenuKey = value);
+
+            _gmcmAdvancedAdded = true;
+        }
+
         private void AddNpcToggleOptions()
         {
-            if (_gmcm is null) return;
-            foreach (var name in Config.NpcAllowed.Keys.OrderBy(n => n))
+            if (_gmcm is null)
+                return;
+
+            foreach (var pair in GetPreferredNpcToggleEntries())
             {
-                if (_addedNpcToggles.Contains(name)) continue;
-		_gmcm.AddBoolOption(
-			mod: ModManifest,
-			name: () => name, // keep the NPC's proper name as-is
-			getValue: () => Config.NpcAllowed[name],
-			setValue: v => Config.NpcAllowed[name] = v,
-			tooltip: () => Helper.Translation.Get("gmcm.npcToggle.tooltip", new { name }).ToString(),
-			fieldId: $"npc_{name}"
-		);                
-		_addedNpcToggles.Add(name);
+                string rawName = pair.RawName;
+                string displayName = pair.DisplayName;
+
+                if (_addedNpcToggles.Contains(rawName))
+                    continue;
+
+                _gmcm.AddBoolOption(
+                    mod: ModManifest,
+                    name: () => displayName,
+                    getValue: () => Config.NpcAllowed[rawName],
+                    setValue: value => Config.NpcAllowed[rawName] = value,
+                    tooltip: () => BuildNpcTooltip(rawName, displayName),
+                    fieldId: $"npc_{rawName}");
+
+                _addedNpcToggles.Add(rawName);
             }
         }
 
-        // ────────── Debug console commands ──────────
+        private IEnumerable<(string RawName, string DisplayName)> GetPreferredNpcToggleEntries()
+        {
+            var chosen = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (string rawName in Config.NpcAllowed.Keys.OrderBy(static n => n, StringComparer.OrdinalIgnoreCase))
+            {
+                string displayName = GetNpcDisplayName(rawName);
+
+                if (!chosen.TryGetValue(displayName, out string? existingRawName))
+                {
+                    chosen[displayName] = rawName;
+                    continue;
+                }
+
+                if (GetNpcToggleNamePriority(rawName, displayName) > GetNpcToggleNamePriority(existingRawName, displayName))
+                    chosen[displayName] = rawName;
+            }
+
+            foreach (var pair in chosen.OrderBy(static p => p.Key, StringComparer.OrdinalIgnoreCase))
+                yield return (pair.Value, pair.Key);
+        }
+
+        private static int GetNpcToggleNamePriority(string rawName, string displayName)
+        {
+            if (Game1.characterData.ContainsKey(rawName) && !Game1.characterData.ContainsKey(displayName))
+                return 4;
+
+            if (string.Equals(rawName, displayName, StringComparison.Ordinal))
+                return 3;
+
+            if (!rawName.Contains('.') && !rawName.Contains('_'))
+                return 2;
+
+            return 1;
+        }
+
+        private Action<string, string[]> Guarded(Action<string, string[]> inner)
+        {
+            return (command, args) =>
+            {
+                if (!Context.IsWorldReady)
+                {
+                    Monitor.Log("Load a save first.", LogLevel.Warn);
+                    return;
+                }
+
+                if (!Config.EnableDebugCommands)
+                {
+                    Monitor.Log("Debug commands are disabled. Enable them in GMCM > Advanced > Enable Debug Commands.", LogLevel.Warn);
+                    return;
+                }
+
+                inner(command, args);
+            };
+        }
+
         private void RegisterConsoleCommands()
         {
-            // original
-            Helper.ConsoleCommands.Add("dr.dumpstatus", "Show modData (debug)", Guarded(DumpStatus));
-            Helper.ConsoleCommands.Add("dr.debugpool", "List eligible NPCs (debug)", Guarded(DebugPool));
             Helper.ConsoleCommands.Add("dr.clearcooldown", "Clear bouquet cooldown (debug)",
                 Guarded((_, __) =>
                 {
@@ -561,313 +1071,86 @@ namespace Dating_Reversed
                     ModData.Remove(DailyNpcKey);
                     Monitor.Log("Cooldown cleared", LogLevel.Alert);
                 }));
-            Helper.ConsoleCommands.Add("dr.clearall", "Full reset (debug)", Guarded(ClearAll));
-            Helper.ConsoleCommands.Add("dr.forceevent", "dr.forceevent <NPC>  (debug)", Guarded(ForceEvent));
-            Helper.ConsoleCommands.Add("dr.playevent", "Play today's bouquet on Farm (debug)",
-                Guarded((_, __) =>
+        }
+
+        private sealed class BouquetEventService
+        {
+            private readonly ModEntry _mod;
+
+            public BouquetEventService(ModEntry mod)
+            {
+                _mod = mod;
+            }
+
+            public bool TryStartOnCurrentLocation(string npcName)
+            {
+                if (!StardewModdingAPI.Context.IsWorldReady || Game1.eventUp || Game1.activeClickableMenu != null)
+                    return false;
+                if (Game1.currentLocation is not Farm farm)
+                    return false;
+                if (!_mod._npcToEventId.TryGetValue(npcName, out int eventId))
+                    return false;
+
+                string eventData = BuildMainEvent(npcName, eventId);
+                farm.startEvent(new Event(eventData));
+                return true;
+            }
+
+            private string BuildMainEvent(string npcName, int eventId)
+            {
+                int farmerTileX = (int)(Game1.player.Position.X / Game1.tileSize);
+                int farmerTileY = (int)(Game1.player.Position.Y / Game1.tileSize);
+                string playerName = Game1.player.Name;
+
+                string ask1 = Clean(_mod.SafeI18n("bouquet.ask").Replace("@", playerName));
+                string ask2 = Clean(_mod.SafeI18n("bouquet.q").Replace("@", playerName));
+                string prompt = CleanBranch(Fallback(_mod.Helper.Translation.Get("bouquet.prompt").ToString(), "Will you accept this bouquet?"));
+                string yesLabel = CleanBranch(Fallback(_mod.Helper.Translation.Get("bouquet.choiceYes").ToString(), "Yes"));
+                string noLabel = CleanBranch(Fallback(_mod.Helper.Translation.Get("bouquet.choiceNo").ToString(), "Not right now"));
+                string acceptLine = CleanBranch(_mod.SafeI18n("bouquet.accept").Replace("@", playerName));
+                string rejectLine = CleanBranch(_mod.SafeI18n("bouquet.reject").Replace("@", playerName));
+
+                // Both answers are inlined via quickQuestion instead of 'fork', so the outcome never depends on
+                // Data/Events/Farm, which other mods can reload or replace between the event starting and the answer.
+                string acceptBranch = string.Join("\\",
+                    $"emote {npcName}? 20",
+                    "pause 400",
+                    $"speak {npcName}? \"{acceptLine}\"",
+                    "addItem 458",
+                    $"addConversationTopic DR_ACCEPT_{eventId} 1",
+                    "end");
+                string rejectBranch = string.Join("\\",
+                    $"emote {npcName}? 28",
+                    "pause 400",
+                    $"speak {npcName}? \"{rejectLine}\"",
+                    $"addConversationTopic DR_REJECT_{eventId} 1",
+                    "end");
+
+                string[] parts =
                 {
-                    if (!ModData.TryGetValue(DailyNpcKey, out var n) || string.IsNullOrEmpty(n))
-                        return;
+                    "none",
+                    "-1000 -1000",
+                    $"farmer {farmerTileX} {farmerTileY} 2 {npcName} {farmerTileX} {farmerTileY + 1} 0",
+                    $"faceDirection {npcName}? 0",
+                    "faceDirection farmer 2",
+                    $"speak {npcName}? \"{ask1}\"",
+                    "pause 80",
+                    $"speak {npcName}? \"{ask2}\"",
+                    "pause 80",
+                    $"quickQuestion {prompt}#{yesLabel}#{noLabel}(break){acceptBranch}(break){rejectBranch}",
+                    "end"
+                };
 
-                    // 1.6-safe warp using tile from Position
-                    if (Game1.currentLocation is not Farm)
-                    {
-                        int tx = (int)(Game1.player.Position.X / Game1.tileSize);
-                        int ty = (int)(Game1.player.Position.Y / Game1.tileSize);
-                        Game1.warpFarmer("Farm", tx, ty, false);
-                    }
-
-                    Helper.GameContent.InvalidateCache("Data/Events/Farm");
-                    Helper.GameContent.Load<Dictionary<string, string>>("Data/Events/Farm");
-                    Game1.getFarm().startEvent(new Event(BuildBouquetEvent(n)));
-                }));
-            Helper.ConsoleCommands.Add("dr.setdating", "dr.setdating <NPC>  (debug)", Guarded((_, a) =>
-            {
-                if (a.Length > 0) ApplyDating(a[0]);
-            }));
-            Helper.ConsoleCommands.Add("dr.unsetdating", "dr.unsetdating <NPC>  (debug)", Guarded(UnsetDating));
-            Helper.ConsoleCommands.Add("dr.sethall", "dr.sethall <hearts 0-10> (debug)", Guarded(SetAllHeartsCommand));
-            Helper.ConsoleCommands.Add("dr.getpoints", "dr.getpoints <NPC>  (debug)", Guarded(GetPointsCommand));
-            Helper.ConsoleCommands.Add("dr.setpoints", "dr.setpoints <NPC> <hearts|points>  (debug)", Guarded(SetPointsCommand));
-
-            // new
-            Helper.ConsoleCommands.Add("dr.explainpool", "List each NPC with the first exclusion reason", Guarded((_, __) => ExplainPool()));
-            Helper.ConsoleCommands.Add("dr.dumpids", "Show count and names in _npcToEventId", Guarded((_, __) =>
-            {
-                Monitor.Log($"EID map count: {_npcToEventId.Count}", LogLevel.Alert);
-                foreach (var k in _npcToEventId.Keys.OrderBy(k => k))
-                    Monitor.Log($" - {k}", LogLevel.Trace);
-            }));
-            Helper.ConsoleCommands.Add("dr.repick", "Clear today & cooldown, then repick", Guarded((_, __) =>
-            {
-                ModData.Remove(DailyNpcKey);
-                ModData.Remove(CooldownDayKey);
-                PickDailyBouquetNpc();
-                Monitor.Log($"Repicked. DailyNpc = {(ModData.TryGetValue(DailyNpcKey, out var n) ? n : "<none>")}", LogLevel.Alert);
-            }));
-        }
-
-        // used by dr.explainpool
-        private void ExplainPool()
-        {
-            int month = GetMonthKey();
-            foreach (var name in _npcToEventId.Keys.OrderBy(n => n))
-            {
-                var npc = Game1.getCharacterFromName(name);
-                if (npc is null) { LogEx(name, "no instance"); continue; }
-                if (!GenderAllowed(npc)) { LogEx(name, "gender disabled in GMCM"); continue; }
-                if (!Config.NpcAllowed.TryGetValue(name, out var ok) || !ok) { LogEx(name, "NPC toggle off"); continue; }
-                if (!Game1.player.friendshipData.TryGetValue(name, out var fs)) { LogEx(name, "no friendship entry"); continue; }
-                if (fs.Points < EligibleMin) { LogEx(name, $"points {fs.Points} < 2000 "); continue; }
-                if (fs.Points >= EligibleMaxExclusive) { LogEx(name, $"points {fs.Points} ≥ 2300"); continue; }
-                if (fs.Status == FriendshipStatus.Dating) { LogEx(name, "already Dating"); continue; }
-                if (ModData.ContainsKey(SeenThisMonthKey(name, month))) { LogEx(name, "seen this month"); continue; }
-
-                Monitor.Log($"OK: {name}", LogLevel.Info);
-            }
-            void LogEx(string n, string why) => Monitor.Log($"NO: {n} — {why}", LogLevel.Info);
-        }
-
-        private void DumpStatus(string _, string[] __)
-        {
-            var d = ModData;
-			
-			string L(string k) => Helper.Translation.Get(k).ToString();
-			string none = L("gmcm.status.none");
-
-			string dailyNpc  = d.TryGetValue(DailyNpcKey, out var dn) ? dn : none;
-			string monthCount= d.TryGetValue(BouquetEventsThisMonthKey, out var mc) ? mc : none;
-
-            Monitor.Log($"DailyNpc: {dailyNpc}", LogLevel.Info);
-            Monitor.Log($"MonthCount: {monthCount}", LogLevel.Info);
-
-            // EventMonth pretty print
-            if (d.TryGetValue(BouquetEventMonthKey, out var em) && int.TryParse(em, out int m))
-            {
-                int y = Math.Max(1, m / 100);
-                int s = m % 100;
-                Monitor.Log($"EventMonth: {SeasonName(s)} (Year {y}) [{em}]", LogLevel.Info);
-            }
-            else
-            {
-                Monitor.Log("EventMonth: none", LogLevel.Info);
+                return string.Join("/", parts);
             }
 
-            // Cooldown pretty print
-            if (d.TryGetValue(CooldownDayKey, out var cds) && int.TryParse(cds, out var until))
-            {
-                int today = Game1.Date.TotalDays;
-                int remaining = Math.Max(0, until - today);
-                Monitor.Log($"Cooldown: {(remaining > 0 ? $"{remaining} day(s) remaining (until index {until})" : "none")}", LogLevel.Info);
-            }
-            else
-            {
-                Monitor.Log("Cooldown: none", LogLevel.Info);
-            }
-        }
-        private void DebugPool(string _, string[] __)
-        {
-            int month = GetMonthKey();
-            var list = new List<string>();
-            foreach (var name in _npcToEventId.Keys)
-            {
-                var npc = Game1.getCharacterFromName(name);
-                if (npc is null) continue;
-                if (!GenderAllowed(npc)) continue;
-                if (!Config.NpcAllowed.TryGetValue(name, out var ok) || !ok) continue;
-                if (!Game1.player.friendshipData.TryGetValue(name, out var fs)) continue;
-                if (fs.Points < EligibleMin || fs.Points >= EligibleMaxExclusive) continue;
-                if (fs.Status == FriendshipStatus.Dating) continue;
-                if (ModData.ContainsKey(SeenThisMonthKey(name, month))) continue;
+            private static string Clean(string text)
+                => text.Replace("#", "＃").Replace("\"", "\\\"").Replace("\n", "\\n");
 
-                list.Add(name);
-            }
-            Monitor.Log("Eligible NPCs: " + string.Join(", ", list), LogLevel.Info);
-        }
-
-        private void ForceEvent(string cmd, string[] args)
-        {
-            if (args.Length < 1) { Monitor.Log("Usage: dr.forceevent <NPC>", LogLevel.Warn); return; }
-            var npc = args[0];
-            if (!_npcToEventId.ContainsKey(npc)) { Monitor.Log("Unknown NPC", LogLevel.Warn); return; }
-
-            ModData[DailyNpcKey] = npc;
-            _applied.Remove(_npcToEventId[npc].ToString());
-            Monitor.Log($"Forced {npc}", LogLevel.Alert);
-        }
-
-        private void UnsetDating(string cmd, string[] args)
-        {
-            if (args.Length < 1) { Monitor.Log("Usage: dr.unsetdating <NPC>", LogLevel.Warn); return; }
-            if (Game1.player.friendshipData.TryGetValue(args[0], out var fs))
-            {
-                fs.Status = FriendshipStatus.Friendly;
-                fs.Points = Math.Min(fs.Points, 1999);
-            }
-        }
-
-        private void SetAllHearts(int pts, bool refreshUi)
-        {
-            int touched = 0;
-
-            foreach (var name in _npcToEventId.Keys)
-            {
-                // ensure a friendship entry exists
-                if (!Game1.player.friendshipData.TryGetValue(name, out var fs))
-                    Game1.player.friendshipData[name] = fs = new Friendship();
-
-                // ALWAYS set the raw value (works even if NPC isn't instanced)
-                fs.Points = pts;
-
-                // keep non-dating status for pool logic; clear dating if dropping below 2000
-                if (fs.Status == FriendshipStatus.Dating && pts < 2000)
-                    fs.Status = FriendshipStatus.Friendly;
-                else if (fs.Status != FriendshipStatus.Dating)
-                    fs.Status = FriendshipStatus.Friendly;
-
-                // OPTIONAL: if NPC is currently loaded, poke Social UI to refresh immediately
-                if (refreshUi)
-                {
-                    var npcObj = Game1.getCharacterFromName(name);
-                    if (npcObj != null)
-                    {
-                        // zero-net nudge forces the UI to recalc now
-                        Game1.player.changeFriendship(1, npcObj);
-                        Game1.player.changeFriendship(-1, npcObj);
-                    }
-                }
-
-                touched++;
-            }
-
-            Monitor.Log($"All set to {pts} pts ({pts / 250} ♥) — touched {touched} NPC(s).", LogLevel.Alert);
-        }
-        private void SetAllHeartsCommand(string cmd, string[] args)
-        {
-            if (args.Length < 1 || !int.TryParse(args[0], out int hearts))
-            {
-                Monitor.Log("Usage: dr.sethall <hearts 0-10>", LogLevel.Warn);
-                return;
-            }
-
-            hearts = Math.Clamp(hearts, 0, 10);
-            int pts = hearts * 250; // 1 heart = 250 points
-
-            SetAllHearts(pts, true); // reuse your UI-safe setter
-            Monitor.Log($"Set all datables to {hearts} ♥ ({pts} pts).", LogLevel.Alert);
-        }
-
-        private void ClearAll(string cmd, string[] args)
-        {
-            // clear per-mod keys
-            ModData.Remove(DailyNpcKey);
-            ModData.Remove(BouquetEventMonthKey);
-            ModData.Remove(BouquetEventsThisMonthKey);
-            ModData.Remove(CooldownDayKey);
-
-            // remove per-NPC per-month gates
-            var toRemove = ModData.Keys
-                .Where(k => k.StartsWith("DatingReversed/Seen/", StringComparison.Ordinal))
-                .ToList();
-            foreach (var k in toRemove)
-                ModData.Remove(k);
-
-            _applied.Clear();
-
-            // reset friendships to pre-bouquet
-            foreach (var name in _npcToEventId.Keys)
-            {
-                if (Game1.player.friendshipData.TryGetValue(name, out var fs))
-                {
-                    fs.Status = FriendshipStatus.Friendly;
-                    fs.Points = Math.Min(fs.Points, 1999);
-                }
-            }
-            Monitor.Log("Full reset", LogLevel.Alert);
-        }
-        private void GetPointsCommand(string cmd, string[] args)
-        {
-            if (args.Length < 1) { Monitor.Log("Usage: dr.getpoints <NPC>", LogLevel.Warn); return; }
-            var name = args[0];
-            if (!Game1.player.friendshipData.TryGetValue(name, out var fs))
-            {
-                Monitor.Log($"{name}: no friendship entry.", LogLevel.Info);
-                return;
-            }
-            Monitor.Log($"{name}: {fs.Points} pts ({fs.Points / 250} ♥), status={fs.Status}", LogLevel.Alert);
-        }
-
-        private void SetPointsCommand(string cmd, string[] args)
-        {
-            if (args.Length < 2) { Monitor.Log("Usage: dr.setpoints <NPC> <hearts|points>", LogLevel.Warn); return; }
-
-            var name = args[0];
-            if (!int.TryParse(args[1], out int val)) { Monitor.Log("2nd arg must be an integer (hearts 0–10 or raw points).", LogLevel.Warn); return; }
-
-            // hearts if 0..10; otherwise treat as raw points
-            int pts = (val >= 0 && val <= 10) ? val * 250 : val;
-
-            if (!Game1.player.friendshipData.TryGetValue(name, out var fs))
-                Game1.player.friendshipData[name] = fs = new Friendship();
-
-            fs.Points = pts;
-            if (fs.Status == FriendshipStatus.Dating && pts < 2000)
-                fs.Status = FriendshipStatus.Friendly;
-
-            var npcObj = Game1.getCharacterFromName(name);
-            if (npcObj != null)
-            {
-                // UI nudge so Social page refreshes immediately (no net change)
-                Game1.player.changeFriendship(1, npcObj);
-                Game1.player.changeFriendship(-1, npcObj);
-            }
-
-            Monitor.Log($"Set {name} → {pts} pts ({pts / 250} ♥).", LogLevel.Alert);
-        }
-
-        // debug helper
-        private string BuildBouquetEvent(string npc) => BuildBouquetEventInternal(npc);
-
-        private string BuildBouquetEventInternal(string npc)
-        {
-            int eid = _npcToEventId[npc];
-            string yesId = (eid * 10 + 1).ToString();
-
-            string Clean(string s) => s.Replace("#", "＃").Replace("\"", "\\\"").Replace("\n", "\\n");
-
-            string ask1 = Clean(SafeI18n("bouquet.ask").Replace("@", Game1.player.Name));
-            string ask2 = Clean(SafeI18n("bouquet.q").Replace("@", Game1.player.Name));
-            string prompt = Clean(Fallback(Helper.Translation.Get("bouquet.prompt").ToString(), "Will you accept this bouquet?"));
-            string yesLabel = Clean(Fallback(Helper.Translation.Get("bouquet.choiceYes").ToString(), "Yes"));
-            string noLabel = Clean(Fallback(Helper.Translation.Get("bouquet.choiceNo").ToString(), "Not right now"));
-            string reject = Clean(SafeI18n("bouquet.reject").Replace("@", Game1.player.Name));
-
-            int px = (int)(Game1.player.Position.X / Game1.tileSize);
-            int py = (int)(Game1.player.Position.Y / Game1.tileSize);
-
-            var parts = new[]
-            {
-                "none", "-1000 -1000",
-                $"farmer {px} {py} 2 {npc} {px} {py + 1} 0",
-                $"faceDirection {npc} 0",
-                $"faceDirection farmer 2",
-                $"speak {npc} \"{ask1}\"",
-                "pause 80",
-                $"speak {npc} \"{ask2}\"",
-                "pause 80",
-                $"question fork0 \"{prompt}#{yesLabel}#{noLabel}\"",
-                $"fork {yesId}",
-                $"emote {npc} 28",
-                "pause 400",
-                $"speak {npc} \"{reject}\"",
-                $"addConversationTopic DR_REJECT_{eid} 1",
-                "end"
-            };
-
-            Helper.GameContent.InvalidateCache("Data/Events/Farm");
-            Helper.GameContent.Load<Dictionary<string, string>>("Data/Events/Farm");
-
-            return string.Join("/", parts);
+            // quickQuestion branches are split on '\' and "(break)", so backslash escapes can't be used inside them.
+            private static string CleanBranch(string text)
+                => text.Replace("#", "＃").Replace("\\", "＼").Replace("\"", "＂").Replace("/", "／")
+                    .Replace("(break)", "(brk)").Replace("\r", "").Replace("\n", " ");
         }
     }
 }
