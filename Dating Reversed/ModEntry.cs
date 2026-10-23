@@ -1310,13 +1310,34 @@ namespace Dating_Reversed
                 }
             }
 
+            // Latin languages draw dialogue with the game's bitmap font (LooseSprites/font_bold), which has no glyph for
+            // full-width characters or these typographic quotes and leaves a blank gap instead. Other languages use
+            // fonts that do have full-width characters, so they keep those as stand-ins.
+            private static bool UsesBitmapFont => LocalizedContentManager.CurrentLanguageLatin;
+
+            private static string ToDrawable(string text)
+            {
+                if (!UsesBitmapFont)
+                    return text;
+
+                return text
+                    .Replace('‘', '\'').Replace('‚', '\'').Replace('´', '\'')
+                    .Replace('“', '\'').Replace('”', '\'').Replace('„', '\'').Replace('"', '\'')
+                    .Replace("…", "...");
+            }
+
             private static string Clean(string text)
-                => text.Replace("#", "＃").Replace("\"", "\\\"").Replace("\n", "\\n");
+                => ToDrawable(text).Replace("#", UsesBitmapFont ? "№" : "＃").Replace("\"", "\\\"").Replace("\n", "\\n");
 
             // quickQuestion branches are split on '\' and "(break)", so backslash escapes can't be used inside them.
             private static string CleanBranch(string text)
-                => text.Replace("#", "＃").Replace("\\", "＼").Replace("\"", "＂").Replace("/", "／")
+            {
+                bool bitmap = UsesBitmapFont;
+                return ToDrawable(text)
+                    .Replace("#", bitmap ? "№" : "＃").Replace("\\", bitmap ? "-" : "＼")
+                    .Replace("\"", bitmap ? "'" : "＂").Replace("/", bitmap ? "-" : "／")
                     .Replace("(break)", "(brk)").Replace("\r", "").Replace("\n", " ");
+            }
         }
     }
 }
