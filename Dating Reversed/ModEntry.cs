@@ -1091,40 +1091,86 @@ namespace Dating_Reversed
                 if (!_mod._npcToEventId.TryGetValue(npcName, out int eventId))
                     return false;
 
-                string eventData = BuildMainEvent(npcName, eventId);
+                string? eventData = BuildMainEvent(npcName, eventId);
+                if (eventData is null)
+                    return false;
+
                 farm.startEvent(new Event(eventData));
                 return true;
             }
 
-            private string BuildMainEvent(string npcName, int eventId)
+            // Community translations feed straight into the event script, so a stray character can break its
+            // structure. Check the script with the game's own parser and fall back to English text if it's broken.
+            private string? BuildMainEvent(string npcName, int eventId)
+            {
+                BouquetScript script = BuildScript(npcName, eventId, englishOnly: false);
+                if (script.TryValidate(out string problem))
+                    return script.Text;
+
+                _mod.Monitor.Log($"[DR] The '{_mod.Helper.Translation.Locale}' translation broke the bouquet event ({problem}). Using English text instead; please report this to the translation's author.", LogLevel.Warn);
+
+                script = BuildScript(npcName, eventId, englishOnly: true);
+                if (script.TryValidate(out problem))
+                    return script.Text;
+
+                _mod.Monitor.Log($"[DR] The bouquet event for {npcName} is broken even in English ({problem}); skipping it.", LogLevel.Error);
+                return null;
+            }
+
+            private string GetText(string key, bool englishOnly)
+            {
+                if (!englishOnly)
+                    return _mod.Helper.Translation.Get(key).ToString();
+
+                return _mod.Helper.Translation.GetInAllLocales(key).TryGetValue("", out Translation? english)
+                    ? english.ToString()
+                    : "";
+            }
+
+            private string GetRandomLine(string baseKey, bool englishOnly)
+            {
+                if (!englishOnly)
+                    return _mod.SafeI18n(baseKey);
+
+                string text = GetText($"{baseKey}.{Game1.random.Next(1, 21)}", englishOnly: true);
+                return string.IsNullOrWhiteSpace(text) ? GetText($"{baseKey}.1", englishOnly: true) : text;
+            }
+
+            private BouquetScript BuildScript(string npcName, int eventId, bool englishOnly)
             {
                 int farmerTileX = (int)(Game1.player.Position.X / Game1.tileSize);
                 int farmerTileY = (int)(Game1.player.Position.Y / Game1.tileSize);
                 string playerName = Game1.player.Name;
 
-                string ask1 = Clean(_mod.SafeI18n("bouquet.ask").Replace("@", playerName));
-                string ask2 = Clean(_mod.SafeI18n("bouquet.q").Replace("@", playerName));
-                string prompt = CleanBranch(Fallback(_mod.Helper.Translation.Get("bouquet.prompt").ToString(), "Will you accept this bouquet?"));
-                string yesLabel = CleanBranch(Fallback(_mod.Helper.Translation.Get("bouquet.choiceYes").ToString(), "Yes"));
-                string noLabel = CleanBranch(Fallback(_mod.Helper.Translation.Get("bouquet.choiceNo").ToString(), "Not right now"));
-                string acceptLine = CleanBranch(_mod.SafeI18n("bouquet.accept").Replace("@", playerName));
-                string rejectLine = CleanBranch(_mod.SafeI18n("bouquet.reject").Replace("@", playerName));
+                string ask1 = Clean(GetRandomLine("bouquet.ask", englishOnly).Replace("@", playerName));
+                string ask2 = Clean(GetRandomLine("bouquet.q", englishOnly).Replace("@", playerName));
+                string prompt = CleanBranch(Fallback(GetText("bouquet.prompt", englishOnly), "Will you accept this bouquet?"));
+                string yesLabel = CleanBranch(Fallback(GetText("bouquet.choiceYes", englishOnly), "Yes"));
+                string noLabel = CleanBranch(Fallback(GetText("bouquet.choiceNo", englishOnly), "Not right now"));
+                string acceptLine = CleanBranch(GetRandomLine("bouquet.accept", englishOnly).Replace("@", playerName));
+                string rejectLine = CleanBranch(GetRandomLine("bouquet.reject", englishOnly).Replace("@", playerName));
 
                 // Both answers are inlined via quickQuestion instead of 'fork', so the outcome never depends on
                 // Data/Events/Farm, which other mods can reload or replace between the event starting and the answer.
-                string acceptBranch = string.Join("\\",
+                string[] acceptCommands =
+                {
                     $"emote {npcName}? 20",
                     "pause 400",
                     $"speak {npcName}? \"{acceptLine}\"",
                     "addItem 458",
                     $"addConversationTopic DR_ACCEPT_{eventId} 1",
-                    "end");
-                string rejectBranch = string.Join("\\",
+                    "end"
+                };
+                string[] rejectCommands =
+                {
                     $"emote {npcName}? 28",
                     "pause 400",
                     $"speak {npcName}? \"{rejectLine}\"",
                     $"addConversationTopic DR_REJECT_{eventId} 1",
-                    "end");
+                    "end"
+                };
+                string acceptBranch = string.Join("\\", acceptCommands);
+                string rejectBranch = string.Join("\\", rejectCommands);
 
                 string[] parts =
                 {
@@ -1141,7 +1187,63 @@ namespace Dating_Reversed
                     "end"
                 };
 
-                return string.Join("/", parts);
+                return new BouquetScript(string.Join("/", parts), parts.Length, acceptCommands.Length, rejectCommands.Length);
+            }
+
+            private sealed record BouquetScript(string Text, int CommandCount, int AcceptCount, int RejectCount)
+            {
+                // Mirrors how the game reads the script: Event.ParseCommands for the '/' split, the
+                // quickQuestion handler for '(break)', '#' and '\', and SplitBySpaceQuoteAware for arguments.
+                public bool TryValidate(out string problem)
+                {
+                    string[] commands = Event.ParseCommands(Text);
+                    if (commands.Length != CommandCount)
+                    {
+                        problem = $"expected {CommandCount} commands but the game read {commands.Length}";
+                        return false;
+                    }
+
+                    string? question = commands.FirstOrDefault(static c => c.StartsWith("quickQuestion ", StringComparison.Ordinal));
+                    if (question is null)
+                    {
+                        problem = "the yes/no question is missing";
+                        return false;
+                    }
+
+                    string[] sections = question.Substring(question.IndexOf(' ') + 1).Split("(break)");
+                    if (sections.Length != 3)
+                    {
+                        problem = $"expected 2 answer branches but the game read {sections.Length - 1}";
+                        return false;
+                    }
+
+                    string[] choices = sections[0].Split('#');
+                    if (choices.Length != 3 || choices.Any(string.IsNullOrWhiteSpace))
+                    {
+                        problem = "the question or its Yes/No choices are blank or split apart";
+                        return false;
+                    }
+
+                    string[] accept = sections[1].Split('\\');
+                    string[] reject = sections[2].Split('\\');
+                    if (accept.Length != AcceptCount || reject.Length != RejectCount)
+                    {
+                        problem = "an answer's reaction was split into extra commands";
+                        return false;
+                    }
+
+                    foreach (string command in commands.Concat(accept).Concat(reject))
+                    {
+                        if (command.StartsWith("speak ", StringComparison.Ordinal) && ArgUtility.SplitBySpaceQuoteAware(command).Length != 3)
+                        {
+                            problem = $"a line of dialogue was split apart: {command}";
+                            return false;
+                        }
+                    }
+
+                    problem = "";
+                    return true;
+                }
             }
 
             private static string Clean(string text)
