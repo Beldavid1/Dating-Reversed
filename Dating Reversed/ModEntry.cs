@@ -30,11 +30,19 @@ namespace Dating_Reversed
         private const int SafeBaseEventIdSpan = 10_000_000;
         private const int SafeBaseEventIdMaxExclusive = SafeBaseEventIdMin + SafeBaseEventIdSpan;
 
+        // Each bouquet.* dialogue key has this many numbered variants in i18n.
+        private const int DialogueVariantCount = 20;
+
         private ModConfig Config = null!;
         private readonly Dictionary<string, int> _npcToEventId = new(StringComparer.Ordinal);
         private readonly HashSet<string> _appliedEventOutcomes = new(StringComparer.Ordinal);
         private readonly Queue<Action> _nextTickQueue = new();
         private readonly HashSet<string> _addedNpcToggles = new(StringComparer.Ordinal);
+
+        // Game1.random is reseeded from the save every morning, so reloading a save replays the same lines.
+        // Dialogue uses its own generator instead, and remembers the last pick per key to avoid back-to-back repeats.
+        private readonly Random _dialogueRandom = new();
+        private readonly Dictionary<string, int> _lastDialogueIndex = new(StringComparer.Ordinal);
 
         private bool _lateRefreshRan;
         private IGenericModConfigMenuApi? _gmcm;
@@ -823,9 +831,28 @@ namespace Dating_Reversed
         private static string Fallback(string value, string defaultValue)
             => string.IsNullOrWhiteSpace(value) ? defaultValue : value;
 
+        private int PickDialogueIndex(string baseKey)
+        {
+            int index;
+            if (_lastDialogueIndex.TryGetValue(baseKey, out int last))
+            {
+                // Pick uniformly from the other variants.
+                index = _dialogueRandom.Next(1, DialogueVariantCount);
+                if (index >= last)
+                    index++;
+            }
+            else
+            {
+                index = _dialogueRandom.Next(1, DialogueVariantCount + 1);
+            }
+
+            _lastDialogueIndex[baseKey] = index;
+            return index;
+        }
+
         private string SafeI18n(string baseKey)
         {
-            int index = Game1.random.Next(1, 21);
+            int index = PickDialogueIndex(baseKey);
             string text = Helper.Translation.Get($"{baseKey}.{index}").ToString();
             if (string.IsNullOrWhiteSpace(text))
                 text = Helper.Translation.Get($"{baseKey}.1").ToString();
@@ -1132,7 +1159,7 @@ namespace Dating_Reversed
                 if (!englishOnly)
                     return _mod.SafeI18n(baseKey);
 
-                string text = GetText($"{baseKey}.{Game1.random.Next(1, 21)}", englishOnly: true);
+                string text = GetText($"{baseKey}.{_mod.PickDialogueIndex(baseKey)}", englishOnly: true);
                 return string.IsNullOrWhiteSpace(text) ? GetText($"{baseKey}.1", englishOnly: true) : text;
             }
 
